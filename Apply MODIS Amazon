@@ -1,15 +1,21 @@
 # ============================================================
-# AMAZÔNIA — Export mensal com REGIÕES INTELIGENTES + GCS/Drive + retomada
-# - Particiona a ROI (convex-hulls por clusters) ⇒ MUITO menos tasks
-# - Filtra por água (JRC) por região/mês
-# - Exporta para GCS (recomendado) ou Drive, com backoff + retomada
-# - Features na ordem do seu modelo (pickle)
-# - "predict" local compatível com os GeoTIFFs exportados
+# AMAZÔNIA — MODIS → Features Mensais (GEE) + Predição Local
+# Fast path:
+#   - 1 export/mês (BBox) com fatiamento (fileDimensions) → GCS/Drive
+#   - Evita enviar ROI complexa ao EE (usa só BBox)
+#   - QA 500 m server-side; composição mensal (median | mean)
+#   - Sem redução de dados; mantém 100% dos pixels válidos
+#
+# Modo:
+#   MODE="export"  → agenda exports de features (GeoTIFFs fatiados)
+#   MODE="predict" → aplica modelo local às features baixadas
+#
+# Mostra apenas erros críticos (warnings suprimidos).
 # ============================================================
 
-# !pip -q install earthengine-api rasterio joblib numpy matplotlib geopandas shapely fiona pyproj requests scikit-learn google-api-python-client
+# !pip -q install earthengine-api rasterio joblib numpy matplotlib geopandas shapely fiona pyproj requests
 
-import os, warnings, sys, subprocess, importlib, time, json, random, math
+import os, sys, subprocess, importlib, warnings, json
 from pathlib import Path
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
@@ -17,10 +23,8 @@ import matplotlib.pyplot as plt
 
 def _ensure(pkg, imp=None):
     name = imp or pkg.split('==')[0].split('>=')[0]
-    try:
-        importlib.import_module(name)
-    except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    try: importlib.import_module(name)
+    except Exception: subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 for pkg, imp in [
     ("earthengine-api>=1.0.0","ee"),
@@ -31,167 +35,133 @@ for pkg, imp in [
     ("pyproj>=3.5","pyproj"),
     ("joblib>=1.2","joblib"),
     ("requests>=2.31","requests"),
-    ("scikit-learn>=1.3","sklearn"),
-    ("google-api-python-client>=2.129","googleapiclient"),
 ]:
     _ensure(pkg, imp)
 
 warnings.filterwarnings("ignore")
 os.environ["CPL_DEBUG"] = "OFF"
+
+# reduzir verbosidade de clientes http
 import logging
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("googleapiclient.discovery").setLevel(logging.ERROR)
 logging.getLogger("googleapiclient.http").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 import ee, joblib, geopandas as gpd, fiona, rasterio as rio
 from rasterio.merge import merge as rio_merge
 from rasterio.warp import transform_geom
 from rasterio.features import rasterize
 from rasterio.plot import plotting_extent
-from shapely.geometry import box, mapping, Point
+from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 from shapely.validation import make_valid
-from sklearn.cluster import MiniBatchKMeans
-from googleapiclient.errors import HttpError
 
 # ---------------- CONFIG ----------------
 MODE                  = "export"       # "export" | "predict"
 
 EE_PROJECT            = os.environ.get("EE_PROJECT", "ee-enneralcantarabariri")
-SHP_PATH              = "/content/Hydro_lakes_AM_basin.shp"   # shapefile da planície/espelho d'água
+SHP_PATH              = "/content/Hydro_lakes_AM_basin.shp"       # shapefile da planície/lagos (EPSG:4326)
 
-# Período
+# Intervalo temporal
 START_YEAR            = 2001
 END_YEAR              = 2024
-MONTHS_FILTER         = None           # ex.: [6,12] para testar
+MONTHS_FILTER         = None           # None → 1..12; ou ex.: [6,12]
 
-# MODIS composição
-USE_8DAY              = True
-PAD_DAYS              = 4
+# Coleções/Composição
+USE_8DAY              = True           # MOD09A1/MYD09A1 (8 dias @ 500 m)
+PAD_DAYS              = 4              # padding ao redor do mês
 COMPOSITE             = "median"       # "median" | "mean"
 
-# Água/mascara server-side
+# Máscara água server-side (JRC occurrence)
 USE_JRC_WATER         = True
 JRC_OCC_THRESH        = 5              # %
 
-# Export
+# Saída e resolução
 TARGET_CRS            = "EPSG:4326"
 TARGET_SCALE          = 500            # m
-EXPORT_TO             = "GCS"          # "GCS" | "DRIVE"
-GCS_BUCKET            = "meu-bucket-amazonia"   # <<< EDITE AQUI se usar GCS
-DRIVE_FOLDER          = "amazonia_features"
-MAX_PIXELS            = int(1e13)
-
-# Modelo (ordem das features)
-MODEL_PATH            = "/content/artifacts_amazonia/amazonia_svr_global.pkl"
-PRED_INVERSE          = "ln1p"
+MAX_PIXELS            = 1e13
 NODATA_PRED           = -9999.0
 
-# Regiões inteligentes
-N_REGIONS             = 20             # ~20 regiões ⇒ ~20 tasks/mês
-SAMPLE_STEP_KM        = 10             # amostragem ~10 km p/ clustering
+# Export destino
+EXPORT_TO             = "GCS"          # "GCS" | "DRIVE"
+DRIVE_FOLDER          = "amazonia_features"
+GCS_BUCKET            = "gs://SEU_BUCKET_AQUI"   # ex.: "my-bucket" ou "gs://my-bucket" (aceita ambos)
 
-# Fila/backoff
-MAX_TASKS_PER_RUN     = 1500
-QUEUE_WATERMARK       = 2600
-START_BACKOFF_SEC     = 1.0
-MAX_BACKOFF_SEC       = 30.0
+# Fatiamento/COG (sem perder dados)
+WHOLE_BBOX_PER_MONTH  = True           # 1 task por mês
+FILE_DIMS             = [8192, 8192]   # tamanho de cada pedaço (px)
+TILE_SIZE             = 256            # tile interno do COG
+CLOUD_OPT             = True
+SKIP_EMPTY            = True
 
-# Pastas locais
+# Modelo local
+MODEL_PATH            = "/content/artifacts_amazonia/amazonia_svr_global.pkl"  # contém {"model":..., "features":[...]}
+PRED_INVERSE          = "ln1p"         # "ln1p" | "log10_1p" | None
+
+# Fila GEE (segurança)
+MAX_TASKS_PER_RUN     = 600            # 12 meses * 50 anos = 600 máx numa tacada
+QUEUE_WATERMARK       = 2600           # para não bater 3000 tasks
+CHECK_EVERY_N_MONTHS  = 1              # checar fila entre meses
+
+# Pastas locais (predição/plots temporários)
 ART_DIR               = Path("/content/artifacts_amazonia_modis"); ART_DIR.mkdir(exist_ok=True, parents=True)
-PRED_DIR              = ART_DIR/"pred";  PRED_DIR.mkdir(exist_ok=True, parents=True)
+PRED_DIR              = ART_DIR/"pred"; PRED_DIR.mkdir(exist_ok=True, parents=True)
 PLOT_DIR              = ART_DIR/"plots"; PLOT_DIR.mkdir(exist_ok=True, parents=True)
-TMP_DIR               = ART_DIR/"tmp";   TMP_DIR.mkdir(exist_ok=True, parents=True)
-STATE_DIR             = ART_DIR/"state"; STATE_DIR.mkdir(exist_ok=True, parents=True)  # retomada
+TMP_DIR               = ART_DIR/"tmp";  TMP_DIR.mkdir(exist_ok=True, parents=True)
 
-# MODIS bands
+# Bandas MODIS (500m)
 SR_BANDS              = ["sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07"]
+QA_BAND_1KM           = "state_1km"
 QA_BAND_500M          = "sur_refl_qc_500m"
 
-# ---------------- Utils básicos ----------------
+# ---------------- Utils ----------------
 def _err(x): print(x)
 
 def ee_init():
-    try: ee.Initialize(project=EE_PROJECT)
+    try:
+        ee.Initialize(project=EE_PROJECT)
     except Exception:
-        ee.Authenticate(auth_mode='notebook'); ee.Initialize(project=EE_PROJECT)
+        ee.Authenticate(auth_mode='notebook')
+        ee.Initialize(project=EE_PROJECT)
 
-# ---------- ROI ----------
-def load_roi():
+def parse_bucket_name(b):
+    if not b: return ""
+    return b.replace("gs://","").strip("/")
+
+# ---------------- ROI (apenas local; nunca envia a geometria complexa ao EE) ----------------
+def load_roi_local():
     if not Path(SHP_PATH).exists():
         raise FileNotFoundError(f"[ROI] Shapefile não encontrado: {SHP_PATH}")
     with fiona.Env(SHAPE_RESTORE_SHX='YES'):
         gdf = gpd.read_file(SHP_PATH)
     if gdf.crs is None or str(gdf.crs).upper() != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
-    geoms=[]
-    for g in gdf.geometry:
-        if g is None or g.is_empty: continue
-        try: gv = make_valid(g)
-        except Exception: gv = g.buffer(0)
+    geoms = []
+    for geom in gdf.geometry:
+        if geom is None or geom.is_empty: continue
+        try: gv = make_valid(geom)
+        except Exception: gv = geom.buffer(0)
         if gv.is_empty: continue
         geoms.append(gv)
-    if not geoms: raise ValueError("[ROI] Geometrias inválidas.")
+    if not geoms:
+        raise ValueError("[ROI] Geometrias inválidas/vazias.")
     uni = unary_union(geoms)
+    if uni.is_empty:
+        raise ValueError("[ROI] União vazia.")
     xmin,ymin,xmax,ymax = uni.bounds
-    # Vamos NUNCA enviar a ROI complexa ao EE (apenas retângulos)
-    roi_rect_ee = ee.Geometry.Rectangle([xmin,ymin,xmax,ymax], proj="EPSG:4326", geodesic=False)
-    return gpd.GeoDataFrame(geometry=[uni], crs="EPSG:4326"), uni, roi_rect_ee
+    roi_rect_ee = ee.Geometry.Rectangle([xmin,ymin,xmax,ymax], proj="EPSG:4326", geodesic=False)  # BBox simples
+    gdf_ok = gpd.GeoDataFrame(geometry=[uni], crs="EPSG:4326")
+    return gdf_ok, uni, roi_rect_ee
 
-# ---------- REGIÕES INTELIGENTES ----------
-def approx_deg_for_km(km):  # ~ no equador
-    return km / 111.32
+# ---------------- MODIS + QA + Composição ----------------
+def scale_qc(img):
+    sr = img.select(SR_BANDS).multiply(0.0001).rename(SR_BANDS)
+    qa1 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_1KM),  img.select(QA_BAND_1KM),  ee.Image(0).rename(QA_BAND_1KM)))
+    qa2 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_500M), img.select(QA_BAND_500M), ee.Image(0).rename(QA_BAND_500M)))
+    sr = sr.updateMask(qa2.bitwiseAnd(3).lte(1))  # Ideal/Good
+    return sr.addBands([qa1, qa2]).copyProperties(img, img.propertyNames())
 
-def lonlat_grid(bounds, step_deg):
-    xmin,ymin,xmax,ymax = bounds
-    xs = np.arange(xmin, xmax, step_deg)
-    ys = np.arange(ymin, ymax, step_deg)
-    pts=[]
-    for x in xs:
-        for y in ys:
-            pts.append((x+step_deg/2, y+step_deg/2))
-    return np.array(pts) if pts else np.empty((0,2))
-
-def partition_roi_regions(roi_geom, n_regions=N_REGIONS, sample_step_km=SAMPLE_STEP_KM):
-    step_deg = approx_deg_for_km(sample_step_km)
-    grid = lonlat_grid(roi_geom.bounds, step_deg)
-    inside = []
-    if grid.size:
-        for x,y in grid:
-            if roi_geom.contains(Point(x,y)):
-                inside.append([x,y])
-    # se poucos pontos, cai para 1 região (a própria ROI)
-    if len(inside) < max(10, n_regions*3):
-        return [roi_geom]
-    X = np.array(inside)
-    k = min(n_regions, len(X)//10)
-    if k < 2:
-        return [roi_geom]
-    mbk = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=2048, n_init="auto")
-    labels = mbk.fit_predict(X)
-    regions=[]
-    for cid in range(k):
-        pts = X[labels==cid]
-        if pts.shape[0] < 3: continue
-        poly = gpd.GeoSeries([Point(px,py) for px,py in pts]).unary_union.convex_hull
-        inter = poly.intersection(roi_geom)
-        if inter.is_empty: continue
-        if inter.area < 1e-8: continue
-        regions.append(inter)
-    return regions or [roi_geom]
-
-# ---------- JRC filtro por região ----------
-def has_water_in_region(region_poly, thresh=JRC_OCC_THRESH):
-    try:
-        x0,y0,x1,y1 = region_poly.bounds
-        region_ee = ee.Geometry.Rectangle([x0,y0,x1,y1], proj="EPSG:4326", geodesic=False)
-        jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence").gte(thresh)
-        s = jrc.reduceRegion(ee.Reducer.sum(), geometry=region_ee, scale=TARGET_SCALE, maxPixels=1e12)
-        val = s.get("occurrence").getInfo()
-        return (val or 0) > 0
-    except Exception:
-        # fallback permissivo (não bloqueia)
-        return True
-
-# ---------- MODIS ----------
 def build_collection_month(roi_rect_ee, year, month):
     start = ee.Date.fromYMD(year, month, 1)
     end   = start.advance(1, "month")
@@ -206,16 +176,8 @@ def build_collection_month(roi_rect_ee, year, month):
         mod = ee.ImageCollection("MODIS/061/MOD09GA").filterDate(start, end)
         myd = ee.ImageCollection("MODIS/061/MYD09GA").filterDate(start, end)
 
-    def scale_qc(img):
-        sr = img.select(SR_BANDS).multiply(0.0001)
-        bn = img.bandNames()
-        qa = ee.Image(ee.Algorithms.If(bn.contains(QA_BAND_500M), img.select(QA_BAND_500M), ee.Image(0)))
-        sr = sr.updateMask(qa.bitwiseAnd(3).lte(1))  # Ideal/Good
-        return sr
-
     ic = mod.merge(myd).filterBounds(roi_rect_ee).map(scale_qc)
-    mos = ic.select(SR_BANDS)
-    mos = mos.mean() if COMPOSITE=="mean" else mos.median()
+    mos = (ic.select(SR_BANDS).median() if COMPOSITE=="median" else ic.select(SR_BANDS).mean())
 
     if USE_JRC_WATER:
         jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
@@ -224,19 +186,21 @@ def build_collection_month(roi_rect_ee, year, month):
 
     return mos.clip(roi_rect_ee).reproject(TARGET_CRS, None, TARGET_SCALE)
 
-# ---------- Features (ordem do modelo) ----------
+# ---------------- Features (compatíveis com seu modelo) ----------------
+# Mapear bandas MODIS (500 m) para proxies de "Rrs_*"
 MODIS_TO_RRS = {
-    "Rrs_443":"sur_refl_b03",
-    "Rrs_490":"sur_refl_b03",
-    "Rrs_510":"sur_refl_b04",
-    "Rrs_560":"sur_refl_b04",
-    "Rrs_620":"sur_refl_b01",
-    "Rrs_665":"sur_refl_b01",
+    "Rrs_443": "sur_refl_b03",
+    "Rrs_490": "sur_refl_b03",
+    "Rrs_510": "sur_refl_b04",
+    "Rrs_560": "sur_refl_b04",
+    "Rrs_620": "sur_refl_b01",
+    "Rrs_665": "sur_refl_b01",
 }
 
 def build_features_image(mosaic, feature_names):
     base = {b: mosaic.select(b) for b in SR_BANDS}
-    proxies = {k: base[v] for k,v in MODIS_TO_RRS.items() if v in base}
+    proxies = {k: base[v] for k, v in MODIS_TO_RRS.items() if v in base}
+
     def safe_add(lst):
         if not lst: return None
         out = lst[0]
@@ -244,163 +208,183 @@ def build_features_image(mosaic, feature_names):
         return out
     L1 = safe_add([base[b] for b in SR_BANDS]).add(1e-12)
 
-    Rrs_709=None
+    # 709 virtual (interp b04→b01)
+    Rrs_709 = None
     if all(b in base for b in ("sur_refl_b01","sur_refl_b04")):
-        lam1,lam2,lamT=560.0,665.0,709.0
-        slope=base["sur_refl_b01"].subtract(base["sur_refl_b04"]).divide((lam2-lam1)+1e-12)
-        Rrs_709=base["sur_refl_b04"].add(slope.multiply(lamT-lam1)).max(0)
+        lam1, lam2, lamT = 560.0, 665.0, 709.0
+        slope = base["sur_refl_b01"].subtract(base["sur_refl_b04"]).divide((lam2 - lam1) + 1e-12)
+        Rrs_709 = base["sur_refl_b04"].add(slope.multiply(lamT - lam1)).max(0)
 
-    def lerp(l):
+    def lerp_665_to_709(l):
         if (Rrs_709 is None) or ("sur_refl_b01" not in base): return None
-        t=(l-665.0)/(709.0-665.0)
+        t = (l - 665.0) / (709.0 - 665.0)
         return base["sur_refl_b01"].add(Rrs_709.subtract(base["sur_refl_b01"]).multiply(t)).max(0)
 
-    Rrs_681, Rrs_700, Rrs_705, Rrs_708 = lerp(681.0), lerp(700.0), lerp(705.0), lerp(708.0)
+    Rrs_681 = lerp_665_to_709(681.0)
+    Rrs_700 = lerp_665_to_709(700.0)
+    Rrs_705 = lerp_665_to_709(705.0)
+    Rrs_708 = lerp_665_to_709(708.0)
+
+    # Derivadas simples (b03, b04, b01, 709v)
+    bands_for_deriv = [im for im in [base.get("sur_refl_b03"), base.get("sur_refl_b04"), base.get("sur_refl_b01"), Rrs_709] if im]
+    def deriv_stats(img_list):
+        if len(img_list) < 3: return None, None, None, None
+        stack = ee.Image.cat(img_list)
+        d1_list = [stack.select(i).subtract(stack.select(i-1)) for i in range(1,len(img_list))]
+        d1 = ee.Image.cat(d1_list)
+        d1_mean = d1.reduce(ee.Reducer.mean())
+        d1_p95  = d1.reduce(ee.Reducer.percentile([95])).rename(d1_mean.bandNames())
+        if len(d1_list) < 2: return d1_mean, d1_p95, None, None
+        d2_list = [d1_list[i].subtract(d1_list[i-1]) for i in range(1,len(d1_list))]
+        d2 = ee.Image.cat(d2_list)
+        d2_mean = d2.reduce(ee.Reducer.mean())
+        d2_p95  = d2.reduce(ee.Reducer.percentile([95])).rename(d2_mean.bandNames())
+        return d1_mean, d1_p95, d2_mean, d2_p95
+    d1_mean_img, d1_p95_img, d2_mean_img, d2_p95_img = deriv_stats(bands_for_deriv)
 
     def pick(stem):
-        table={
-            "Rrs_681":Rrs_681,"Rrs_700":Rrs_700,"Rrs_705":Rrs_705,"Rrs_708":Rrs_708,"Rrs_709":Rrs_709,
-            "Rrs_443":proxies.get("Rrs_443"),"Rrs_490":proxies.get("Rrs_490"),
-            "Rrs_510":proxies.get("Rrs_510"),"Rrs_560":proxies.get("Rrs_560"),
-            "Rrs_620":proxies.get("Rrs_620"),"Rrs_665":proxies.get("Rrs_665"),
+        table = {
+            "Rrs_681":Rrs_681, "Rrs_700":Rrs_700, "Rrs_705":Rrs_705, "Rrs_708":Rrs_708, "Rrs_709":Rrs_709,
+            "Rrs_443":proxies.get("Rrs_443"), "Rrs_490":proxies.get("Rrs_490"),
+            "Rrs_510":proxies.get("Rrs_510"), "Rrs_560":proxies.get("Rrs_560"),
+            "Rrs_620":proxies.get("Rrs_620"), "Rrs_665":proxies.get("Rrs_665"),
+            "d1_mean":d1_mean_img, "d1_p95":d1_p95_img, "d2_mean":d2_mean_img, "d2_p95":d2_p95_img
         }
-        return table.get(stem,None)
+        return table.get(stem, None)
 
-    bands=[]
+    bands = []
     for fname in feature_names:
-        img=pick(fname)
+        img = pick(fname)
 
         if img is None and fname.endswith("_norm560"):
-            stem=fname[:-8]; b=pick(stem)
-            if b is not None and proxies.get("Rrs_560") is not None: img=b.divide(proxies["Rrs_560"].add(1e-12)).rename(fname)
+            stem = fname[:-8]; b = pick(stem)
+            if b is not None and proxies.get("Rrs_560") is not None: img = b.divide(proxies["Rrs_560"].add(1e-12)).rename(fname)
         if img is None and fname.endswith("_norm547"):
-            stem=fname[:-8]; b=pick(stem)
-            if b is not None and base.get("sur_refl_b04") is not None: img=b.divide(base["sur_refl_b04"].add(1e-12)).rename(fname)
-        if img is None and fname=="norm_Rrs_L1": img=L1.rename(fname)
+            stem = fname[:-8]; b = pick(stem)
+            if b is not None and (base.get("sur_refl_b04") is not None): img = b.divide(base["sur_refl_b04"].add(1e-12)).rename(fname)
+        if img is None and fname == "norm_Rrs_L1": img = L1.rename(fname)
         if img is None and fname.endswith("_normL1"):
-            stem=fname[:-7]; b=pick(stem)
-            if b is not None: img=b.divide(L1).rename(fname)
+            stem = fname[:-7]; b = pick(stem)
+            if b is not None: img = b.divide(L1).rename(fname)
 
-        if img is None and fname=="G_over_B" and base.get("sur_refl_b04") is not None and base.get("sur_refl_b03") is not None:
+        if img is None and fname == "G_over_B" and base.get("sur_refl_b04") is not None and base.get("sur_refl_b03") is not None:
             img = base["sur_refl_b04"].divide(base["sur_refl_b03"].add(1e-12)).rename(fname)
-        if img is None and fname=="B_over_R" and base.get("sur_refl_b03") is not None and base.get("sur_refl_b01") is not None:
+        if img is None and fname == "B_over_R" and base.get("sur_refl_b03") is not None and base.get("sur_refl_b01") is not None:
             img = base["sur_refl_b03"].divide(base["sur_refl_b01"].add(1e-12)).rename(fname)
-        if img is None and fname=="NDCI" and (Rrs_709 is not None) and base.get("sur_refl_b01") is not None:
+        if img is None and fname == "NDCI" and (Rrs_709 is not None) and base.get("sur_refl_b01") is not None:
             img = Rrs_709.subtract(base["sur_refl_b01"]).divide(Rrs_709.add(base["sur_refl_b01"]).add(1e-12)).rename(fname)
-        if img is None and fname=="Red_a":
+        if img is None and fname == "Red_a":
             if (Rrs_681 is not None) and base.get("sur_refl_b01") is not None:
                 img = (Rrs_681.subtract(base["sur_refl_b01"])).divide(Rrs_681.add(base["sur_refl_b01"]).add(1e-12)).rename(fname)
             else:
                 img = ee.Image(0).rename(fname)
-        if img is None and fname=="RedEdgeSlope":
+        if img is None and fname == "RedEdgeSlope":
             if (Rrs_709 is not None) and (Rrs_681 is not None): img = Rrs_709.subtract(Rrs_681).rename(fname)
             elif (Rrs_709 is not None): img = Rrs_709.subtract(base["sur_refl_b01"]).rename(fname)
-        if img is None and fname=="Area_Blue" and base.get("sur_refl_b03") is not None:  img = base["sur_refl_b03"].rename(fname)
-        if img is None and fname=="Area_Green" and base.get("sur_refl_b04") is not None: img = base["sur_refl_b04"].rename(fname)
-        if img is None and fname=="Area_Red"  and base.get("sur_refl_b01") is not None: img = base["sur_refl_b01"].rename(fname)
-        if img is None and fname=="Area_RE"   and (Rrs_709 is not None): img = Rrs_709.rename(fname)
+
+        if img is None and fname == "Area_Blue":  img = base["sur_refl_b03"].rename(fname)
+        if img is None and fname == "Area_Green": img = base["sur_refl_b04"].rename(fname)
+        if img is None and fname == "Area_Red":   img = base["sur_refl_b01"].rename(fname)
+        if img is None and fname == "Area_RE" and (Rrs_709 is not None): img = Rrs_709.rename(fname)
+
+        if img is None and fname == "d1_mean" and d1_mean_img is not None: img = d1_mean_img.rename(fname)
+        if img is None and fname == "d1_p95"  and d1_p95_img  is not None: img = d1_p95_img.rename(fname)
+        if img is None and fname == "d2_mean" and d2_mean_img is not None: img = d2_mean_img.rename(fname)
+        if img is None and fname == "d2_p95"  and d2_p95_img  is not None: img = d2_p95_img.rename(fname)
 
         if img is None: img = ee.Image(0).rename(fname)
         bands.append(img)
 
     return ee.Image.cat(bands).reproject(TARGET_CRS, None, TARGET_SCALE)
 
-# ---------- fila & backoff ----------
+# ---------------- Fila GEE ----------------
+def list_active_task_descriptions():
+    descs = set()
+    try:
+        for t in ee.batch.Task.list():
+            st = t.status().get('state','')
+            if st in ('READY','RUNNING'):
+                d = t.config.get('description') if hasattr(t,'config') else t.status().get('description','')
+                if d: descs.add(d)
+    except Exception as e:
+        _err(f"[queue] {e}")
+    return descs
+
 def count_active_tasks():
     try:
         return sum(1 for t in ee.batch.Task.list() if t.status().get('state','') in ('READY','RUNNING'))
-    except Exception: return 0
+    except Exception as e:
+        _err(f"[queue] {e}")
+        return 0
 
-def _start_task_with_backoff(make_task_fn, desc):
-    backoff = START_BACKOFF_SEC
-    while True:
-        try:
-            task = make_task_fn()
-            task.start()
-            return True
-        except HttpError as e:
-            msg = str(e)
-            if any(s in msg for s in ["Too many tasks","503","quota","Rate Limit"]):
-                time.sleep(min(backoff + random.uniform(0, backoff/3), MAX_BACKOFF_SEC))
-                backoff = min(backoff*1.8, MAX_BACKOFF_SEC)
-                continue
-            _err(f"[start] {desc}: {msg}")
-            return False
-        except Exception as e:
-            _err(f"[start] {desc}: {e}")
-            return False
+# ---------------- Fast path: 1 export por mês (BBox com fatiamento) ----------------
+def export_month_bbox(roi_rect_ee, year, month, feature_names):
+    ym = f"{year:04d}-{month:02d}"
+    mosaic   = build_collection_month(roi_rect_ee, year, month)
+    feats_im = build_features_image(mosaic, feature_names)
 
-# ---------- retomada ----------
-def done_marker(desc):
-    return STATE_DIR / f"{desc}.started"
+    # Região = BBox (sem geometria complexa)
+    bounds = roi_rect_ee.bounds().getInfo()
+    region = ee.Geometry.Rectangle(bounds['coordinates'][0], proj="EPSG:4326", geodesic=False)
 
-def already_marked(desc):
-    return done_marker(desc).exists()
+    desc = f"feats_{ym}_bbox"
+    fmt_opts = {'cloudOptimized': CLOUD_OPT, 'skipEmptyTiles': SKIP_EMPTY}
 
-def mark_started(desc):
-    m = done_marker(desc)
-    try:
-        m.write_text("started")
-    except Exception:
-        pass
+    if EXPORT_TO.upper() == "GCS":
+        bucket = parse_bucket_name(GCS_BUCKET)
+        if not bucket:
+            raise ValueError("Defina GCS_BUCKET para EXPORT_TO='GCS' (ex.: 'gs://meu-bucket').")
+        task = ee.batch.Export.image.toCloudStorage(
+            image=feats_im,
+            description=desc,
+            bucket=bucket,
+            fileNamePrefix=f"{DRIVE_FOLDER}/{desc}",
+            region=region,
+            scale=TARGET_SCALE,
+            crs=TARGET_CRS,
+            maxPixels=MAX_PIXELS,
+            fileFormat='GeoTIFF',
+            fileDimensions=FILE_DIMS,    # fatiamento (múltiplos arquivos por mês)
+            tileSize=TILE_SIZE,
+            formatOptions=fmt_opts
+        )
+    else:
+        task = ee.batch.Export.image.toDrive(
+            image=feats_im,
+            description=desc,
+            folder=DRIVE_FOLDER,
+            fileNamePrefix=desc,
+            region=region,
+            scale=TARGET_SCALE,
+            crs=TARGET_CRS,
+            maxPixels=MAX_PIXELS,
+            fileFormat='GeoTIFF',
+            fileDimensions=FILE_DIMS,
+            tileSize=TILE_SIZE,
+            formatOptions=fmt_opts
+        )
+    task.start()
+    return desc
 
-# ---------- enqueue usando regiões ----------
-def enqueue_exports_regions(roi_rect_ee, roi_geom, feature_names):
-    # gera regiões
-    regions = partition_roi_regions(roi_geom, N_REGIONS, SAMPLE_STEP_KM)
-    # filtra por água (rápido, por bounds)
-    regions = [r for r in regions if has_water_in_region(r, JRC_OCC_THRESH)]
-    if not regions: regions = [roi_geom]
-
-    years = range(START_YEAR, END_YEAR+1)
-    months = MONTHS_FILTER if MONTHS_FILTER else range(1,13)
-    enqueued=0
-
-    for y in years:
-        for m in months:
-            ym = f"{y:04d}-{m:02d}"
+def enqueue_exports_fast(roi_rect_ee, feature_names):
+    years  = range(START_YEAR, END_YEAR+1)
+    months = MONTHS_FILTER if MONTHS_FILTER else range(1, 13)
+    enq = 0
+    for yi, y in enumerate(years):
+        for mi, m in enumerate(months):
+            if (yi*12 + mi) % CHECK_EVERY_N_MONTHS == 0:
+                if count_active_tasks() >= QUEUE_WATERMARK or enq >= MAX_TASKS_PER_RUN:
+                    return enq
             try:
-                mosaic = build_collection_month(roi_rect_ee, y, m)
-                feats_im = build_features_image(mosaic, feature_names)
+                export_month_bbox(roi_rect_ee, y, m, feature_names)
+                enq += 1
             except Exception as e:
-                _err(f"[{ym}] build features: {e}")
-                continue
+                _err(f"[{y}-{m:02d}] export fail: {e}")
+            if enq >= MAX_TASKS_PER_RUN:
+                return enq
+    return enq
 
-            for ridx, reg in enumerate(regions):
-                if count_active_tasks() >= QUEUE_WATERMARK or enqueued >= MAX_TASKS_PER_RUN:
-                    return enqueued
-                x0,y0,x1,y1 = reg.bounds
-                region = ee.Geometry.Rectangle([x0,y0,x1,y1], proj="EPSG:4326", geodesic=False)
-                desc   = f"feats_{ym}_r{ridx:02d}"
-
-                # retomada: se já marcamos que tentamos enfileirar, não manda de novo
-                if already_marked(desc):
-                    continue
-
-                if EXPORT_TO.upper()=="GCS":
-                    if not GCS_BUCKET:
-                        raise ValueError("Defina GCS_BUCKET para usar EXPORT_TO='GCS'.")
-                    def _mk():
-                        return ee.batch.Export.image.toCloudStorage(
-                            image=feats_im, description=desc, bucket=GCS_BUCKET,
-                            fileNamePrefix=f"{DRIVE_FOLDER}/{desc}", region=region,
-                            scale=TARGET_SCALE, crs=TARGET_CRS, maxPixels=MAX_PIXELS,
-                            fileFormat='GeoTIFF')
-                else:
-                    def _mk():
-                        return ee.batch.Export.image.toDrive(
-                            image=feats_im, description=desc, folder=DRIVE_FOLDER,
-                            fileNamePrefix=desc, region=region, scale=TARGET_SCALE,
-                            crs=TARGET_CRS, maxPixels=MAX_PIXELS, fileFormat='GeoTIFF',
-                            formatOptions={'cloudOptimized': True})
-
-                ok = _start_task_with_backoff(_mk, desc)
-                if ok:
-                    enqueued += 1
-                    mark_started(desc)
-    return enqueued
-
-# ---------- predict local ----------
+# ---------------- Pred local (a partir dos GeoTIFFs de features) ----------------
 def roi_mask_like(ds, roi_gdf, roi_geom):
     geoms_tx = [transform_geom(roi_gdf.crs.to_string(), ds.crs.to_string(), mapping(roi_geom), precision=6)]
     m = rasterize([(g,1) for g in geoms_tx], out_shape=(ds.height, ds.width),
@@ -408,8 +392,8 @@ def roi_mask_like(ds, roi_gdf, roi_geom):
     return m.astype(bool)
 
 def inverse_transform(y):
-    if PRED_INVERSE=="ln1p": return np.expm1(y)
-    if PRED_INVERSE=="log10_1p": return (10.0**y) - 1.0
+    if PRED_INVERSE == "ln1p": return np.expm1(y)
+    if PRED_INVERSE == "log10_1p": return (10.0**y) - 1.0
     return y
 
 def preview_png(tif_path):
@@ -417,10 +401,9 @@ def preview_png(tif_path):
         with rio.open(tif_path) as ds:
             arr = ds.read(1, masked=True); ext = plotting_extent(ds)
         v = arr.compressed()
-        vmin,vmax = (np.percentile(v,(2,98)) if v.size else (0,1))
+        vmin, vmax = (np.percentile(v,(2,98)) if v.size else (0,1))
         plt.figure(figsize=(7,6))
         plt.imshow(arr, extent=ext, vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
-        plt.colorbar(label="Chl-a (mg/m³)", shrink=0.8)
         plt.xticks([]); plt.yticks([]); plt.tight_layout()
         out = PLOT_DIR / f"preview_{Path(tif_path).stem}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
@@ -428,90 +411,127 @@ def preview_png(tif_path):
         _err(f"[preview] {e}")
 
 def predict_local_from_folder(features_root, roi_gdf, roi_geom, model_path=MODEL_PATH):
-    if not Path(model_path).exists(): raise FileNotFoundError(f"[MODEL] Não encontrado: {model_path}")
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"[MODEL] Não encontrado: {model_path}")
     M = joblib.load(model_path)
-    if "model" not in M or "features" not in M: raise ValueError("[MODEL] Estrutura inválida.")
-    files = sorted([str(p) for p in Path(features_root).rglob("feats_*.tif")])
-    if not files: raise FileNotFoundError(f"[predict] Nenhum GeoTIFF em: {features_root}")
+    if "model" not in M or "features" not in M:
+        raise ValueError("[MODEL] Estrutura inválida (faltam 'model' ou 'features').")
+    feats = list(M["features"])
 
-    groups={}
+    files = sorted([str(p) for p in Path(features_root).rglob("feats_*bbox*.tif")] +
+                   [str(p) for p in Path(features_root).rglob("feats_*_t*.tif")])
+    if not files:
+        raise FileNotFoundError(f"[predict] Nenhum GeoTIFF de features encontrado em: {features_root}")
+
+    # agrupa por mês
+    groups = {}
     for f in files:
-        st = Path(f).stem  # feats_YYYY-MM_rNN
-        parts = st.split("_")
-        if len(parts)<3: continue
-        ym = parts[1]
+        st = Path(f).stem  # feats_YYYY-MM_...
+        # tenta extrair YYYY-MM
+        toks = st.split("_")
+        ym = None
+        for t in toks:
+            if len(t)==7 and t[4]=="-":
+                ym = t
+                break
+        if ym is None: 
+            continue
         groups.setdefault(ym, []).append(f)
 
     for ym, paths in sorted(groups.items()):
-        tile_preds=[]
+        tile_preds = []
         for fpath in sorted(paths):
             try:
                 with rio.open(fpath) as ds:
                     B = ds.count
                     arr = ds.read()
-                    prof= ds.profile
-                    valid = np.ones((arr.shape[1],arr.shape[2]), dtype=bool)
-                    for i in range(B): valid &= (ds.read_masks(i+1) > 0)
+                    prof = ds.profile
+
+                    # máscara válida (todas as bandas com dados)
+                    valid_m = np.ones((arr.shape[1], arr.shape[2]), dtype=bool)
+                    for i in range(B):
+                        valid_m &= (ds.read_masks(i+1) > 0)
+
+                    # máscara ROI exata (local)
                     roi_m = roi_mask_like(ds, roi_gdf, roi_geom)
-                    total = valid & roi_m
-                    data  = arr.reshape(B,-1).T.astype("float32")
-                    ylog  = np.full(data.shape[0], np.nan, dtype="float32")
-                    msk   = total.reshape(-1)
-                    if msk.any():
-                        X = data[msk]
+                    total_m = valid_m & roi_m
+                    if not total_m.any():
+                        continue
+
+                    data  = arr.reshape(B, -1).T.astype("float32")
+                    y_log = np.full(data.shape[0], np.nan, dtype="float32")
+                    valid = total_m.reshape(-1)
+
+                    if valid.any():
+                        X = data[valid]
                         finite = np.isfinite(X).all(axis=1)
                         if finite.any():
-                            idx = np.where(msk)[0][finite]
-                            ylog[idx] = M["model"].predict(X[finite]).astype("float32")
-                    ylin = inverse_transform(ylog.astype("float64"))
-                    pred = ylin.reshape(arr.shape[1],arr.shape[2]).astype("float32")
-                    pred[~total] = NODATA_PRED
+                            Xc  = X[finite]
+                            idx = np.where(valid)[0][finite]
+                            y_log[idx] = M["model"].predict(Xc).astype("float32")
+
+                    y_lin = inverse_transform(y_log.astype("float64"))
+                    pred  = y_lin.reshape(arr.shape[1], arr.shape[2]).astype("float32")
+                    pred[~total_m] = NODATA_PRED
                     pred[~np.isfinite(pred)] = NODATA_PRED
 
-                    out_tile = TMP_DIR / f"chla_{ym}_{Path(fpath).stem.split('_r')[-1]}.tif"
+                    out_tile = TMP_DIR / f"chla_{ym}_{Path(fpath).stem.split('feats_')[-1]}.tif"
                     prof_out = prof.copy()
-                    prof_out.update(dtype="float32", count=1, nodata=NODATA_PRED,
-                                    compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
-                    with rio.open(out_tile,"w",**prof_out) as dst: dst.write(pred,1)
+                    prof_out.update(dtype="float32", count=1, nodata=NODATA_PRED, compress="deflate", tiled=True, BIGTIFF="IF_SAFER")
+                    with rio.open(out_tile, "w", **prof_out) as dst:
+                        dst.write(pred, 1)
                     tile_preds.append(str(out_tile))
             except Exception as e:
                 _err(f"[predict {ym}] {e}")
 
-        if not tile_preds: continue
+        if not tile_preds:
+            continue
         try:
-            srcs=[rio.open(p) for p in tile_preds]
+            srcs = [rio.open(p) for p in tile_preds]
             mosaic_arr, mosaic_trans = rio_merge(srcs, nodata=NODATA_PRED)
             for s in srcs: s.close()
             for p in tile_preds: Path(p).unlink(missing_ok=True)
+
             out_path = PRED_DIR / f"amazonia_chla_{ym}.tif"
             meta = {"driver":"GTiff","height":mosaic_arr.shape[1],"width":mosaic_arr.shape[2],
                     "count":1,"dtype":mosaic_arr.dtype,"crs":TARGET_CRS,"transform":mosaic_trans,
                     "nodata":NODATA_PRED,"compress":"deflate","tiled":True,"BIGTIFF":"IF_SAFER"}
-            with rio.open(out_path,"w",**meta) as dst: dst.write(mosaic_arr[0],1)
+            with rio.open(out_path, "w", **meta) as dst:
+                dst.write(mosaic_arr[0], 1)
             preview_png(out_path)
         except Exception as e:
             _err(f"[merge {ym}] {e}")
 
-# ---------- Main ----------
+# ---------------- Main ----------------
 def main():
     try:
         ee_init()
-        roi_gdf, roi_geom, roi_rect_ee = load_roi()
+        roi_gdf, roi_geom, roi_rect_ee = load_roi_local()
 
-        if MODE.lower()=="export":
-            if not Path(MODEL_PATH).exists(): raise FileNotFoundError(f"[MODEL] Não encontrado: {MODEL_PATH}")
+        if MODE.lower() == "export":
+            if not Path(MODEL_PATH).exists():
+                raise FileNotFoundError(f"[MODEL] Não encontrado: {MODEL_PATH}")
             M = joblib.load(MODEL_PATH)
-            if "features" not in M: raise ValueError("[MODEL] 'features' ausente.")
+            if "features" not in M:
+                raise ValueError("[MODEL] 'features' ausente no pickle.")
             features = list(M["features"])
-            enq = enqueue_exports_regions(roi_rect_ee, roi_geom, features)
-        elif MODE.lower()=="predict":
-            # Ajuste o caminho local onde salvou/copiou os GeoTIFFs de features
-            FEATURES_ROOT = "/content/drive/MyDrive/amazonia_features"
+
+            # enfileira 1 task/mês com fatiamento
+            enq = enqueue_exports_fast(roi_rect_ee, features)
+            print(f"[OK] Tarefas enfileiradas: {enq}")
+
+        elif MODE.lower() == "predict":
+            # **Atenção**: baixe/copiei os GeoTIFFs de features para uma pasta local
+            # (ex.: /content/drive/MyDrive/amazonia_features) antes de rodar este modo.
+            FEATURES_ROOT = "/content/drive/MyDrive/amazonia_features"  # ajuste se necessário
             predict_local_from_folder(FEATURES_ROOT, roi_gdf, roi_geom, MODEL_PATH)
+            print("[OK] Predição concluída.")
+
         else:
             raise ValueError("MODE deve ser 'export' ou 'predict'.")
+
     except Exception as e:
         print(f"[fatal] {e}")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
