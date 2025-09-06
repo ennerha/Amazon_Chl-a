@@ -1,31 +1,22 @@
 # ============================================================
-# AMAZÔNIA — MODIS OTIMIZADO (2001–2024, TODOS OS MESES)
-# • Processamento paralelo
-# • Tiles maiores e otimizados
-# • Cache inteligente
-# • Skip de meses já processados
-# • QA rápido+ com state_1km quando disponível
+# AMAZÔNIA — MODIS (TESTE: 2022-01..03) — PERFIL BALANCEADO
+# • Terra+Aqua adaptativo (menos buracos com pouco custo)
+# • Saída padrão: EPSG:3857 @ 750 m (compromisso tempo × detalhe)
+# • Hi-Fidelity 500 m nativo, só em meses muito nublados
+# • QA rápido+ com state_1km
 # • Proxies espectrais por interpolação (490/510/620/665/709)
+# • Paralelização e cache leves
+# • GeoTIFFs com photometric=MINISBLACK (sem WARNING do GDAL)
 # ============================================================
 
-import os, io, zipfile, time, warnings, sys, subprocess, importlib, json, pickle
+import os, io, zipfile, time, warnings, sys, subprocess, importlib, json, pickle, logging
 from pathlib import Path
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import ee, requests, joblib
-import geopandas as gpd
-import fiona, rasterio as rio
-from rasterio.merge import merge as rio_merge
-from rasterio.warp import transform_geom
-from rasterio.features import rasterize
-from shapely.geometry import box, mapping
-from shapely.ops import unary_union
-from shapely.validation import make_valid
-from tqdm import tqdm
 
-# ---------------------- DEPENDÊNCIAS (auto-instalação opcional) ----------------------
+# Auto-instalação leve (opcional)
 def _ensure(pkg, imp=None):
     name = imp or pkg.split('==')[0].split('>=')[0]
     try:
@@ -49,30 +40,46 @@ for pkg, imp in [
     except Exception:
         _ensure(pkg, imp)
 
+import ee, requests, joblib, geopandas as gpd, fiona, rasterio as rio
+from rasterio.merge import merge as rio_merge
+from rasterio.warp import transform_geom
+from rasterio.features import rasterize
+from shapely.geometry import box, mapping
+from shapely.ops import unary_union
+from shapely.validation import make_valid
+from tqdm import tqdm
+
 warnings.filterwarnings("ignore")
+logging.getLogger("rasterio._env").setLevel(logging.ERROR)  # silencia mensagens do driver
 os.environ["CPL_DEBUG"] = "OFF"
 
-# ---------------------- CONFIGURAÇÃO ----------------------
-# PROCESSAMENTO COMPLETO (2001–2024), TODOS OS MESES
-START_YEAR = 2001
-END_YEAR   = 2024
-MONTHS_TO_PROCESS = list(range(1, 13))  # 1..12
+# ---------------------- CONFIGURAÇÃO (TESTE 2022-01..03) ----------------------
+START_YEAR = 2022
+END_YEAR   = 2022
+MONTHS_TO_PROCESS = [1, 2, 3]   # Janeiro, Fevereiro, Março
 
 PAD_DAYS   = 2
 COMPOSITE  = "median"
 
 EE_PROJECT = os.environ.get("EE_PROJECT", "ee-enneralcantarabariri")
-
 SHP_PATH   = "/content/Hydro_lakes_AM_basin.shp"
-USE_JRC_WATER  = False
-JRC_OCC_THRESH = 5  # (não usado com USE_JRC_WATER=False)
 
 # Tiles grandes para reduzir chamadas
 TILE_DEG      = 1.0
-MIN_TILE_DEG  = 0.5  # (mantido para eventual uso futuro)
+MIN_TILE_DEG  = 0.5  # reservado
 
+# PERFIL BALANCEADO
+USE_TERRA_AQUA_ADAPTIVE = True   # ativa Aqua quando Terra estiver ruim
+CLEAR_THRESHOLD = 0.45           # se Terra “limpo” < 45%, mistura Terra+Aqua
+
+# Saída padrão (compromisso): EPSG:3857 @ 750 m
+USE_NATIVE_MODIS_PROJ = False    # nativo global OFF
 TARGET_CRS   = "EPSG:3857"
-TARGET_SCALE = 1000  # 1 km
+TARGET_SCALE = 750               # 750 m
+
+# Hi-Fidelity 500 m apenas em meses muito nublados
+HI_FIDELITY_WHEN_VERY_CLOUDY = True
+HI_FID_THRESHOLD = 0.25          # se Terra “limpo” < 25%, força nativo naquele mês
 
 # Modelo
 MODEL_PATH    = "/content/artifacts_amazonia/amazonia_svr_global.pkl"
@@ -91,12 +98,10 @@ PRED_DIR = ART_DIR/"pred"; PRED_DIR.mkdir(exist_ok=True, parents=True)
 PLOT_DIR = ART_DIR/"plots"; PLOT_DIR.mkdir(exist_ok=True, parents=True)
 CACHE_DIR = ART_DIR/"cache"; CACHE_DIR.mkdir(exist_ok=True, parents=True)
 
-# Cache de ROI/tiles
 TILES_CACHE_PATH = CACHE_DIR / "valid_tiles.pkl"
 
 SR_BANDS = ["sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07"]
 
-# ---------------------- UTILS ----------------------
 def info(x): print(f"[INFO] {x}")
 def err(x):  print(f"[ERROR] {x}")
 
@@ -117,11 +122,11 @@ def get_processed_months():
             try:
                 year, month = f.stem.split("_")[-1].split("-")
                 processed.append((int(year), int(month)))
-            except:  # ignora nomes fora do padrão
+            except:
                 continue
     return set(processed)
 
-# ---------------------- ROI com cache ----------------------
+# ---------------------- ROI (cache) ----------------------
 def load_roi_local():
     roi_cache = CACHE_DIR / "roi_cache.pkl"
     if roi_cache.exists():
@@ -146,7 +151,7 @@ def load_roi_local():
             gv = make_valid(geom)
         except Exception:
             gv = geom.buffer(0)
-        if gv.is_empty: 
+        if gv.is_empty:
             continue
         geoms.append(gv)
 
@@ -177,7 +182,7 @@ def tiles_rects(bounds, step_deg):
         x1 = min(x0+step_deg, xmax)
         for y0 in ys:
             y1 = min(y0+step_deg, ymax)
-            if x1<=x0 or y1<=y0: 
+            if x1<=x0 or y1<=y0:
                 continue
             rects.append((float(x0), float(y0), float(x1), float(y1)))
     return rects
@@ -190,17 +195,16 @@ def filter_tiles_simple(roi_geom, rects):
 # ---------------------- QA rápido+ ----------------------
 def scale_qc_fast(img):
     sr = img.select(SR_BANDS).multiply(0.0001)
-
     band_names = img.bandNames()
     has_qc_500 = band_names.indexOf("sur_refl_qc_500m").neq(-1)
     has_state1 = band_names.indexOf("state_1km").neq(-1)
 
     def _mask_with_state_and_qc():
         qa = img.select("sur_refl_qc_500m")
-        good_qc = qa.bitwiseAnd(3).lte(1)  # 0=good, 1=probably good
+        good_qc = qa.bitwiseAnd(3).lte(1)  # 0 good, 1 probably good
         st = img.select("state_1km")
         cloud_state = st.bitwiseAnd(3)     # bits 0-1
-        clear = cloud_state.eq(0)          # 0=clear
+        clear = cloud_state.eq(0)          # 0 = clear
         return sr.updateMask(good_qc.And(clear))
 
     def _mask_with_qc_only():
@@ -209,34 +213,85 @@ def scale_qc_fast(img):
         return sr.updateMask(good_qc)
 
     def _no_qc():
-        return sr  # fallback
+        return sr
 
     result = ee.Algorithms.If(
-        has_state1,
-        _mask_with_state_and_qc(),
+        has_state1, _mask_with_state_and_qc(),
         ee.Algorithms.If(has_qc_500, _mask_with_qc_only(), _no_qc())
     )
     return ee.Image(result).copyProperties(img, ['system:time_start'])
 
-# ---------------------- Mosaico mensal (Terra MOD09A1) ----------------------
-def build_mosaic_month_fast(roi_bbox_ee, year, month):
+# ---------------------- Métricas e score ----------------------
+def _valid_fraction(img, roi, band="sur_refl_b04"):
+    valid = img.select(band).mask().rename('m')
+    stats = valid.reduceRegion(ee.Reducer.mean(), roi, 1000, maxPixels=1e13)
+    return ee.Number(stats.get('m'))  # 0..1
+
+def _quality_score(img):
+    band_names = img.bandNames()
+    has_state1 = band_names.indexOf("state_1km").neq(-1)
+
+    def with_state():
+        st = img.select("state_1km")
+        cloud_state = st.bitwiseAnd(3)   # 0 clear, 1 cloudy, 2 mixed, 3 not set
+        score = (cloud_state.eq(0).multiply(1.0)
+                 .add(cloud_state.eq(2).multiply(0.5))
+                 .add(cloud_state.eq(1).multiply(0.0))
+                 .add(cloud_state.eq(3).multiply(-1.0)))
+        return score.rename("score")
+
+    def no_state():
+        b04 = img.select("sur_refl_b04")
+        mn = ee.Number(0.01)
+        mx = ee.Number(0.2)
+        b04n = b04.subtract(mn).divide(mx.subtract(mn)).clamp(0,1)
+        return ee.Image(1.0).subtract(b04n).rename("score")
+
+    return ee.Image(ee.Algorithms.If(has_state1, with_state(), no_state()))
+
+# ---------------------- Mosaico Terra+Aqua adaptativo ----------------------
+def build_mosaic_month_adapt(roi_bbox_ee, year, month):
     start = ee.Date.fromYMD(year, month, 1)
     end   = start.advance(1, "month")
     if PAD_DAYS > 0:
         start = start.advance(-PAD_DAYS, "day")
         end   = end.advance(PAD_DAYS, "day")
 
-    # Prefer 061; fallback 006
-    try:
-        mod = ee.ImageCollection("MODIS/061/MOD09A1").filterDate(start, end)
-        ic = mod.filterBounds(roi_bbox_ee).map(scale_qc_fast)
-    except Exception:
-        mod = ee.ImageCollection("MODIS/006/MOD09A1").filterDate(start, end)
-        ic = mod.filterBounds(roi_bbox_ee).map(scale_qc_fast)
+    def coll(path):
+        return (ee.ImageCollection(path)
+                .filterDate(start, end)
+                .filterBounds(roi_bbox_ee)
+                .map(scale_qc_fast))
 
-    mos = ic.select(SR_BANDS)
-    mos = mos.median() if COMPOSITE == "median" else mos.mean()
-    return mos.clip(roi_bbox_ee)
+    # Terra
+    try:
+        terra = coll("MODIS/061/MOD09A1")
+    except Exception:
+        terra = coll("MODIS/006/MOD09A1")
+
+    terra_mos = (terra.select(SR_BANDS).median() if COMPOSITE == "median"
+                 else terra.select(SR_BANDS).mean()).clip(roi_bbox_ee)
+
+    frac_terra = _valid_fraction(terra_mos, roi_bbox_ee)  # 0..1
+
+    if not USE_TERRA_AQUA_ADAPTIVE:
+        return terra_mos, frac_terra
+
+    # Se Terra ruim, mistura com Aqua por qualityMosaic
+    def with_combo():
+        try:
+            aqua = coll("MODIS/061/MYD09A1")
+        except Exception:
+            aqua = coll("MODIS/006/MYD09A1")
+        both = terra.merge(aqua)
+        scored = both.map(lambda im: ee.Image(im.addBands(_quality_score(im))))
+        qm = scored.qualityMosaic("score").select(SR_BANDS)
+        mos = qm if COMPOSITE == "median" else scored.select(SR_BANDS).median()
+        return mos.clip(roi_bbox_ee)
+
+    mosaic_final = ee.Image(ee.Algorithms.If(frac_terra.lt(CLEAR_THRESHOLD),
+                                             with_combo(), terra_mos))
+    return mosaic_final, frac_terra
 
 # ---------------------- Features (proxies por interpolação) ----------------------
 def _lin_interp(img_low, wl_low, img_high, wl_high, wl_target):
@@ -262,7 +317,6 @@ def build_features_image_fast(mosaic, feature_names):
         "Rrs_560": Rrs_560, "Rrs_620": Rrs_620, "Rrs_665": Rrs_665, "Rrs_709": Rrs_709
     }
 
-    # L1 = soma das bandas originais
     L1 = mosaic.select(SR_BANDS).reduce(ee.Reducer.sum()).add(1e-12)
 
     def pick(stem):
@@ -305,19 +359,25 @@ def _region_polygon_from_rect(rect):
     x0,y0,x1,y1 = rect
     return {"type": "Polygon", "coordinates": [[[x0,y0],[x1,y0],[x1,y1],[x0,y1],[x0,y0]]]}
 
-def download_tiles_parallel(feats_im, rects, ym):
+def download_tiles_parallel(feats_im, rects, ym, crs_dyn, scale_dyn):
+    # scale_dyn pode ser ee.Number — normalize
+    try:
+        scale_val = float(scale_dyn.getInfo())
+    except Exception:
+        scale_val = float(scale_dyn)
+
     regions = [_region_polygon_from_rect(r) for r in rects]
     args = []
     for tid, (rect, region) in enumerate(zip(rects, regions)):
         out_tif = FEATURES_DIR / f"feats_{ym}_t{tid:03d}.tif"
-        args.append((feats_im, region, str(out_tif)))
+        args.append((feats_im, region, str(out_tif), crs_dyn, scale_val))
 
     def _dl(arg):
-        img, region_geojson, out_path = arg
+        img, region_geojson, out_path, crs_use, scale_use = arg
         params = {
             "region": region_geojson,
-            "crs": TARGET_CRS,
-            "scale": TARGET_SCALE,
+            "crs": crs_use,
+            "scale": scale_use,
             "maxPixels": int(1e13),
             "format": "GEO_TIFF",
             "resampling": "bilinear"
@@ -354,7 +414,7 @@ def download_tiles_parallel(feats_im, rects, ym):
 
 # ---------------------- Predição ----------------------
 def predict_tile_fast(args):
-    path_tif, roi_gdf, roi_geom, model_data = args
+    path_tif, roi_geom, model_data = args
     try:
         with rio.open(path_tif) as ds:
             arr = ds.read().astype("float32")  # (B,H,W)
@@ -405,11 +465,19 @@ def predict_tile_fast(args):
         pred[~mask] = NODATA_PRED
         pred[~np.isfinite(pred)] = NODATA_PRED
 
+        # ---------- WRITE TILE: photometric=MINISBLACK ----------
         out_tile = TMP_DIR / f"pred_{Path(path_tif).stem}.tif"
         prof_out = {
-            "driver":"GTiff","height":H,"width":W,"count":1,"dtype":"float32",
-            "crs": crs, "transform": transform, "nodata": NODATA_PRED,
-            "compress":"deflate"
+            "driver": "GTiff",
+            "height": H,
+            "width": W,
+            "count": 1,                    # 1 banda (sem alpha)
+            "dtype": "float32",
+            "crs": crs,
+            "transform": transform,
+            "nodata": NODATA_PRED,
+            "compress": "deflate",
+            "photometric": "MINISBLACK"    # evita WARNING do GDAL/Rasterio
         }
         with rio.open(out_tile, "w", **prof_out) as dst:
             dst.write(pred, 1)
@@ -420,8 +488,8 @@ def predict_tile_fast(args):
         err(f"Erro predição {path_tif}: {e}")
         return None
 
-def predict_tiles_parallel(downloaded, roi_gdf, roi_geom, M):
-    predict_args = [(f, roi_gdf, roi_geom, M) for f in downloaded]
+def predict_tiles_parallel(downloaded, roi_geom, M):
+    predict_args = [(f, roi_geom, M) for f in downloaded]
     with ProcessPoolExecutor(max_workers=PROCESS_WORKERS) as executor:
         results = list(tqdm(
             executor.map(predict_tile_fast, predict_args),
@@ -468,7 +536,7 @@ def main():
         raise FileNotFoundError(f"Modelo não encontrado: {MODEL_PATH}")
     M = joblib.load(MODEL_PATH)
 
-    # Tiles (com cache simples de contagem, se quiser evoluir)
+    # Tiles
     rects_all = tiles_rects(roi_geom.bounds, TILE_DEG)
     rects = filter_tiles_simple(roi_geom, rects_all)
     info(f"Processando tiles de {TILE_DEG}° — total: {len(rects)}")
@@ -476,34 +544,23 @@ def main():
     # Meses já processados
     processed = get_processed_months()
 
-    # Lista de meses a processar
+    # Lista de meses a processar (teste 2022-01..03)
     months_todo = []
     for year in range(START_YEAR, END_YEAR + 1):
         for month in MONTHS_TO_PROCESS:
             if (year, month) not in processed:
                 months_todo.append((year, month))
 
-    info(f"Meses a processar: {len(months_todo)} (pular: {len(processed)}) - MODIS 2001–2024")
+    info(f"Meses a processar (teste): {months_todo}")
 
     if not months_todo:
-        info("Todos os meses já foram processados!")
+        info("Nenhum mês pendente para o teste!")
         return
 
     processed_count = 0
 
     for year, month in months_todo:
         ym = f"{year:04d}-{month:02d}"
-
-        # Guarda de disponibilidade do MODIS/061 (não dispara com START_YEAR=2001, mas é seguro)
-        if (year < 2000) or (year == 2000 and month < 2):
-            info(f"[{ym}] Sem dados MOD09A1/061 — pulando.")
-            continue
-
-        # Janela de execução (economiza chamadas quando o tempo estoura)
-        elapsed_h = (time.time() - start_time) / 3600
-        if elapsed_h > 8.5:
-            info(f"Parando por limite de tempo. Processados: {processed_count}")
-            break
 
         info(f"=== {ym} === ({processed_count+1}/{len(months_todo)})")
 
@@ -514,50 +571,78 @@ def main():
             continue
 
         try:
-            # Features
-            mosaic = build_mosaic_month_fast(roi_bbox_ee, year, month)
+            # 1) Mosaico adaptativo + fração “limpa” Terra
+            mosaic, frac_terra = build_mosaic_month_adapt(roi_bbox_ee, year, month)
             feats_im = build_features_image_fast(mosaic, M["features"])
 
-            # Download paralelo
-            downloaded = download_tiles_parallel(feats_im, rects, ym)
+            # 2) Projeção/escala por mês (perfil balanceado)
+            if USE_NATIVE_MODIS_PROJ:
+                mosaic_proj = mosaic.projection()
+                crs_dyn = mosaic_proj.crs()
+                try:
+                    scale_dyn = float(mosaic_proj.nominalScale().getInfo())
+                except Exception:
+                    scale_dyn = 500.0
+            else:
+                crs_dyn = TARGET_CRS
+                scale_dyn = TARGET_SCALE
+
+                # Hi-Fidelity 500 m só em meses muito nublados
+                if HI_FIDELITY_WHEN_VERY_CLOUDY:
+                    try:
+                        frac_val = float(frac_terra.getInfo() or 0.0)
+                    except Exception:
+                        frac_val = 1.0
+                    if frac_val < HI_FID_THRESHOLD:
+                        mosaic_proj = mosaic.projection()
+                        crs_dyn = mosaic_proj.crs()
+                        try:
+                            scale_dyn = float(mosaic_proj.nominalScale().getInfo())
+                        except Exception:
+                            scale_dyn = 500.0
+                        info(f"[{ym}] Muito nublado (Terra={frac_val:.2f}). Forçando nativo ~{scale_dyn:.0f} m.")
+
+            # 3) Download paralelo (features)
+            downloaded = download_tiles_parallel(feats_im, rects, ym, crs_dyn, scale_dyn)
             if not downloaded:
                 err(f"[{ym}] Nenhum download bem-sucedido")
                 continue
             info(f"[{ym}] Downloads: {len(downloaded)}")
 
-            # Predição paralela
-            pred_tiles = predict_tiles_parallel(downloaded, roi_gdf, roi_geom, M)
+            # 4) Predição paralela
+            pred_tiles = predict_tiles_parallel(downloaded, roi_geom, M)
             if not pred_tiles:
                 err(f"[{ym}] Nenhuma predição bem-sucedida")
                 continue
             info(f"[{ym}] Predições: {len(pred_tiles)}")
 
-            # Merge final
+            # 5) Merge final (CRS do conjunto baixado)
             srcs = [rio.open(p) for p in pred_tiles]
             mosaic_arr, mosaic_trans = rio_merge(srcs, nodata=NODATA_PRED)
-            for s in srcs: 
-                s.close()
+            out_crs = srcs[0].crs
+            for s in srcs: s.close()
 
+            # ---------- WRITE MOSAICO: photometric=MINISBLACK ----------
             meta = {
                 "driver": "GTiff",
                 "height": mosaic_arr.shape[1],
                 "width":  mosaic_arr.shape[2],
-                "count":  1,
+                "count":  1,                       # 1 banda
                 "dtype":  mosaic_arr.dtype,
-                "crs":    TARGET_CRS,
+                "crs":    out_crs,
                 "transform": mosaic_trans,
                 "nodata": NODATA_PRED,
                 "compress": "lzw",
-                "tiled": True
+                "tiled": True,
+                "photometric": "MINISBLACK"        # evita WARNING do GDAL/Rasterio
             }
             with rio.open(out_path, "w", **meta) as dst:
                 dst.write(mosaic_arr[0], 1)
 
-            # Preview a cada 5 meses
-            if processed_count % 5 == 0:
-                preview_png_fast(out_path)
+            # 6) Preview a cada mês (como é teste, gera sempre)
+            preview_png_fast(out_path)
 
-            # Limpeza de temporários
+            # 7) Limpeza temporários
             for p in downloaded + pred_tiles:
                 try:
                     Path(p).unlink(missing_ok=True)
@@ -573,7 +658,7 @@ def main():
             continue
 
     total_time = (time.time() - start_time) / 3600
-    info(f"CONCLUÍDO! Processados: {processed_count} meses em {total_time:.1f}h")
+    info(f"CONCLUÍDO (TESTE)! Processados: {processed_count}/{len(months_todo)} meses em {total_time:.1f}h")
 
 # ---------------------- ENTRYPOINT ----------------------
 if __name__ == "__main__":
