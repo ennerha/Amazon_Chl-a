@@ -8,9 +8,11 @@
 #  • Visual rápido (preview) + média mensal (mg m^-3)
 #  • Persistência no Google Drive por ANO/MÊS; arquivos com data MM.DD.AAAA
 #  • Execução em LOTES: processa só os PRÓXIMOS N meses pendentes (BATCH_SIZE)
+#  • Retomada por tile/estágio (download, predição, merge) — sem perdas
+#  • Download em PARTES (chunks de bandas) para ficar < 48 MB/req
 # ============================================================
 
-import os, io, zipfile, time, warnings, sys, subprocess, importlib, json, pickle, logging, shutil
+import os, io, zipfile, time, warnings, sys, subprocess, importlib, json, pickle, logging, shutil, re
 from pathlib import Path
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
@@ -55,7 +57,7 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 logging.getLogger("rasterio._env").setLevel(logging.ERROR)
 os.environ["CPL_DEBUG"] = "OFF"
-os.environ["GEOPANDAS_IO_ENGINE"] = "fiona"   # força engine fiona (recria .shx e evita pyogrio aqui)
+os.environ["GEOPANDAS_IO_ENGINE"] = "fiona"
 
 # ---------------------------------- Google Drive (Colab) ----------------------------------
 try:
@@ -87,42 +89,35 @@ def _ensure_from_legacy(src: Path, dst: Path):
         print(f"[INFO] Entrada copiada para o Drive: {src} -> {dst}")
 
 # ---------------------------------- CONFIG ----------------------------------
-# Intervalo total que você quer cobrir (2001 a 2024)
 START_YEAR = 2001
 END_YEAR   = 2024
-
-# Quais meses de cada ano são elegíveis
-MONTHS_TO_PROCESS = list(range(1, 13))   # todos os meses
-
-# >>> NOVO: tamanho do LOTE por execução (processa só os próximos N meses pendentes)
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))   # 3 por padrão
+MONTHS_TO_PROCESS = list(range(1, 13))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
 
 PAD_DAYS   = 2
 COMPOSITE  = "median"
-
 EE_PROJECT = os.environ.get("EE_PROJECT", "ee-enneralcantarabariri")
 
-# Caminhos de entrada persistentes no Drive
 SHP_PATH   = str(SHAPE_DIR / "Hydro_lakes_AM_basin.shp")
 MODEL_PATH = str(MODEL_DIR / "amazonia_svr_global.pkl")
 _ensure_from_legacy(Path("/content/Hydro_lakes_AM_basin.shp"), Path(SHP_PATH))
 _ensure_from_legacy(Path("/content/artifacts_amazonia/amazonia_svr_global.pkl"), Path(MODEL_PATH))
 
-# tiles grandes = menos chamadas HTTP (aumente se quiser ainda mais rápido)
-TILE_DEG      = float(os.environ.get("TILE_DEG", "3.0"))
+# Tamanho do tile (graus) — 2.0 por padrão para reduzir bytes por download
+TILE_DEG = float(os.environ.get("TILE_DEG", "2.0"))
+
+# Máximo de bandas por download (para manter < 48 MB por requisição)
+MAX_BANDS_PER_DL = int(os.environ.get("MAX_BANDS_PER_DL", "10"))
 
 USE_TERRA_AQUA_ADAPTIVE = True
 CLEAR_THRESHOLD = 0.45
 
-# Modelo
 PRED_INVERSE  = "ln1p"
 NODATA_PRED   = -9999.0
 
-# Paralelismo (ajuste conforme máquina)
-MAX_WORKERS       = int(os.environ.get("DL_THREADS", "6"))        # downloads (I/O)
-PROCESS_WORKERS   = int(os.environ.get("CPU_PROCS", "4"))         # predição (CPU)
+MAX_WORKERS       = int(os.environ.get("DL_THREADS", "6"))     # downloads (I/O)
+PROCESS_WORKERS   = int(os.environ.get("CPU_PROCS", "4"))      # predição (CPU)
 
-# Pastas (placeholders — substituídas a cada mês no main)
 ART_DIR  = DRIVE_ROOT
 FEATURES_DIR = DRIVE_ROOT / "_placeholder_features"
 TMP_DIR  = DRIVE_ROOT / "_placeholder_tmp"
@@ -136,12 +131,21 @@ SR_BANDS = ["sur_refl_b01","sur_refl_b02","sur_refl_b03",
 def info(x): print(f"[INFO] {x}")
 def err(x):  print(f"[ERROR] {x}")
 
-# ---------------------------------- Helpers ROI (robustos p/ 2D/3D) ----------------------------------
+# --------- Utilitários de retomada/observabilidade ----------
+def write_status(month_dir: Path, stage: str, extra=None):
+    try:
+        payload = {"stage": stage, "timestamp": datetime.now().isoformat()}
+        if extra: payload.update(extra)
+        with open(month_dir / "status.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        err(f"status.json falhou: {e}")
+
+# ---------------------------------- Helpers ROI ----------------------------------
 def _ring_xy_closed(coords, ndigits=6):
     out = []
     for c in coords:
-        if c is None:
-            continue
+        if c is None: continue
         try:
             x = float(c[0]); y = float(c[1])
         except Exception:
@@ -149,24 +153,19 @@ def _ring_xy_closed(coords, ndigits=6):
         x = round(x, ndigits); y = round(y, ndigits)
         if not out or (x, y) != out[-1]:
             out.append((x, y))
-    if not out:
-        return []
-    if out[0] != out[-1]:
-        out.append(out[0])
+    if not out: return []
+    if out[0] != out[-1]: out.append(out[0])
     return out if len(out) >= 4 else []
 
 def _poly_to_coords(poly, ndigits=6, max_vertices=5000):
-    if poly is None or poly.is_empty or poly.exterior is None:
-        return []
+    if poly is None or poly.is_empty or poly.exterior is None: return []
     def _rings_from(p):
         ext = _ring_xy_closed(list(p.exterior.coords), ndigits)
-        if not ext:
-            return []
+        if not ext: return []
         holes = []
         for r in p.interiors:
             rr = _ring_xy_closed(list(r.coords), ndigits)
-            if rr:
-                holes.append(rr)
+            if rr: holes.append(rr)
         return [ext] + holes
     rings = _rings_from(poly)
     total = sum(len(r) for r in rings)
@@ -174,37 +173,28 @@ def _poly_to_coords(poly, ndigits=6, max_vertices=5000):
     while rings and total > max_vertices:
         tol = max(tol*2, 1e-6)
         simp = poly.simplify(tol, preserve_topology=True)
-        if simp is None or simp.is_empty or simp.exterior is None:
-            break
+        if simp is None or simp.is_empty or simp.exterior is None: break
         rings = _rings_from(simp)
         total = sum(len(r) for r in rings)
-        if tol > 1e-2:
-            break
+        if tol > 1e-2: break
     return rings
 
 def multipolygon_to_ee_geojson(geom, ndigits=6, max_vertices=5000):
-    if geom is None or geom.is_empty:
-        return None
-    if isinstance(geom, Polygon):
-        polys = [geom]
-    elif isinstance(geom, MultiPolygon):
-        polys = list(geom.geoms)
-    else:
-        return None
+    if geom is None or geom.is_empty: return None
+    if isinstance(geom, Polygon): polys = [geom]
+    elif isinstance(geom, MultiPolygon): polys = list(geom.geoms)
+    else: return None
     all_poly_rings = []
     for p in polys:
         rings = _poly_to_coords(p, ndigits, max_vertices)
-        if rings:
-            all_poly_rings.append(rings)
-    if not all_poly_rings:
-        return None
+        if rings: all_poly_rings.append(rings)
+    if not all_poly_rings: return None
     if len(all_poly_rings) == 1:
         return {"type": "Polygon", "coordinates": all_poly_rings[0]}
     return {"type": "MultiPolygon", "coordinates": all_poly_rings}
 
 def sanitize_polygonal(geom):
-    if geom is None or geom.is_empty:
-        return Polygon()
+    if geom is None or geom.is_empty: return Polygon()
     try:
         geom = make_valid(geom)
     except Exception:
@@ -216,8 +206,7 @@ def sanitize_polygonal(geom):
         for gg in geom.geoms:
             if isinstance(gg, (Polygon, MultiPolygon)):
                 polys.append(gg)
-    if not polys:
-        return Polygon()
+    if not polys: return Polygon()
     return unary_union(polys)
 
 # ---------------------------------- EE init ----------------------------------
@@ -234,26 +223,17 @@ def get_processed_months():
     processed = []
     if DRIVE_ROOT.exists():
         for year_dir in DRIVE_ROOT.iterdir():
-            if not year_dir.is_dir():
-                continue
-            try:
-                y = int(year_dir.name)
-            except Exception:
-                continue
+            if not year_dir.is_dir(): continue
+            try: y = int(year_dir.name)
+            except Exception: continue
             for month_dir in year_dir.iterdir():
-                if not month_dir.is_dir():
-                    continue
-                try:
-                    m = int(month_dir.name)
-                except Exception:
-                    continue
+                if not month_dir.is_dir(): continue
+                try: m = int(month_dir.name)
+                except Exception: continue
                 pred_dir = month_dir / "pred"
-                if not pred_dir.exists():
-                    continue
-                # aceita sufixo com data: amazonia_chla_YYYY-MM__MM.DD.AAAA.tif
-                for f in pred_dir.glob(f"amazonia_chla_{y:04d}-{m:02d}*.tif"):
-                    processed.append((y, m))
-                    break
+                if not pred_dir.exists(): continue
+                for _ in pred_dir.glob(f"amazonia_chla_{y:04d}-{m:02d}*.tif"):
+                    processed.append((y, m)); break
     return set(processed)
 
 # ---------------------------------- ROI (cache + CRS robusto + fallback bbox) ----------------------------------
@@ -277,7 +257,6 @@ def load_roi_local():
     with fiona.Env(SHAPE_RESTORE_SHX='YES'):
         gdf = gpd.read_file(SHP_PATH, engine="fiona")
 
-    # CRS robusto (shapefile sem .prj)
     if gdf.crs is None:
         info("Shapefile sem CRS; assumindo EPSG:4326 (WGS84).")
         gdf = gdf.set_crs("EPSG:4326")
@@ -286,14 +265,10 @@ def load_roi_local():
 
     geoms = []
     for geom in gdf.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        try:
-            gv = make_valid(geom)
-        except Exception:
-            gv = geom.buffer(0)
-        if not gv.is_empty:
-            geoms.append(gv)
+        if geom is None or geom.is_empty: continue
+        try: gv = make_valid(geom)
+        except Exception: gv = geom.buffer(0)
+        if not gv.is_empty: geoms.append(gv)
 
     if not geoms:
         raise ValueError("ROI sem geometrias válidas no shapefile.")
@@ -321,8 +296,7 @@ def tiles_rects(bounds, step_deg):
         x1 = min(x0+step_deg, xmax)
         for y0 in ys:
             y1 = min(y0+step_deg, ymax)
-            if x1<=x0 or y1<=y0:
-                continue
+            if x1<=x0 or y1<=y0: continue
             rects.append((float(x0), float(y0), float(x1), float(y1)))
     return rects
 
@@ -342,7 +316,7 @@ def scale_qc_fast(img):
         qa = img.select("sur_refl_qc_500m")
         good_qc = qa.bitwiseAnd(3).lte(1)
         st = img.select("state_1km")
-        cloud_state = st.bitwiseAnd(3)     # bits 0-1
+        cloud_state = st.bitwiseAnd(3)  # bits 0-1
         clear = cloud_state.eq(0)
         return sr.updateMask(good_qc.And(clear))
 
@@ -412,7 +386,8 @@ def build_mosaic_month_adapt(roi_bbox_ee, year, month):
     frac_terra = _valid_fraction(terra_mos, roi_bbox_ee)
 
     if not USE_TERRA_AQUA_ADAPTIVE:
-        return terra_mos, frac_terra
+        native_proj = ee.Image(terra.first()).select("sur_refl_b01").projection()
+        return terra_mos, frac_terra, native_proj
 
     def with_combo():
         try:
@@ -427,7 +402,8 @@ def build_mosaic_month_adapt(roi_bbox_ee, year, month):
 
     mosaic_final = ee.Image(ee.Algorithms.If(frac_terra.lt(CLEAR_THRESHOLD),
                                              with_combo(), terra_mos))
-    return mosaic_final, frac_terra
+    native_proj = ee.Image(terra.first()).select("sur_refl_b01").projection()
+    return mosaic_final, frac_terra, native_proj
 
 # ---------------------------------- Features ----------------------------------
 def _lin_interp(img_low, wl_low, img_high, wl_high, wl_target):
@@ -472,84 +448,119 @@ def build_features_image_fast(mosaic, feature_names):
 
     for fname in feature_names:
         img = pick(fname)
-
         if img is None and fname.endswith("_norm560"):
             stem = fname[:-8]; b = pick(stem)
-            if b is not None and Rrs_560 is not None:
-                img = b.divide(Rrs_560.add(eps))
+            if b is not None and Rrs_560 is not None: img = b.divide(Rrs_560.add(eps))
         elif img is None and fname == "norm_Rrs_L1":
             img = L1
         elif img is None and fname.endswith("_normL1"):
             stem = fname[:-7]; b = pick(stem)
-            if b is not None:
-                img = b.divide(L1)
-
-        if img is None:
-            img = zero_img
-
+            if b is not None: img = b.divide(L1)
+        if img is None: img = zero_img
         bands.append(img.rename(fname))
 
     return ee.Image.cat(bands)
 
-# ---------------------------------- Download (rápido: nativo sinusoidal) ----------------------------------
-def download_tiles_parallel(feats_im, rects, tile_tag, native_scale, roi_ee=None):
+# -------- Agrupador de partes -> por tile (para a predição) --------
+_tile_regex = re.compile(r"feats_(\d{4}-\d{2}__\d{2}\.\d{2}\.\d{4})_t(\d{3})_p(\d{2})\.tif$")
+
+def group_feature_parts(feature_files):
+    tiles = {}
+    for p in feature_files:
+        name = Path(p).name
+        m = _tile_regex.search(name)
+        if not m:
+            base = name.split(".tif")[0]
+            tiles.setdefault(base, []).append(p)
+            continue
+        tag, tid, pid = m.groups()
+        key = f"{tag}_t{tid}"
+        tiles.setdefault(key, []).append(p)
+    for k in tiles:
+        tiles[k] = sorted(tiles[k], key=lambda s: int(_tile_regex.search(Path(s).name).group(3)))
+    return tiles
+
+# ---------------------------------- Download (nativo sinusoidal, em PARTES) ----------------------------------
+def download_tiles_parallel(feats_im, feature_names, rects, tile_tag, native_scale):
     scale_val = float(native_scale)
+    chunks = [feature_names[i:i+MAX_BANDS_PER_DL] for i in range(0, len(feature_names), MAX_BANDS_PER_DL)]
+
     args = []
     for tid, rect in enumerate(rects):
         rect_ee = ee.Geometry.Rectangle(rect, proj="EPSG:4326", geodesic=False)
-        region_ee = rect_ee if roi_ee is None else rect_ee.intersection(roi_ee, 1)
-        out_tif = FEATURES_DIR / f"feats_{tile_tag}_t{tid:03d}.tif"
-        args.append((feats_im, region_ee, str(out_tif), scale_val))
+        region_ee = rect_ee  # retângulo simples
+        for pi, band_chunk in enumerate(chunks):
+            img_part = feats_im.select(band_chunk)
+            out_tif = FEATURES_DIR / f"feats_{tile_tag}_t{tid:03d}_p{pi:02d}.tif"
+            args.append((img_part, region_ee, str(out_tif), scale_val))
 
     def _dl(arg):
         img, region_ee, out_path, scale_use = arg
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return str(out_path)
         params = {
             "region": region_ee,
-            "scale": scale_use,          # sem 'crs' -> proj nativa (sinusoidal)
+            "scale": scale_use,
             "maxPixels": int(1e13),
-            "format": "GEO_TIFF"
+            "format": "GEO_TIFF",
         }
-        max_retries = 2
+        max_retries = 5
+        base = 2.0
         for attempt in range(max_retries):
             try:
                 url = img.getDownloadURL(params)
-                r = requests.get(url, timeout=300, allow_redirects=True)
+                r = requests.get(url, timeout=900, allow_redirects=True)
                 r.raise_for_status()
                 data = r.content
                 if data[:2] == b'PK':
                     with zipfile.ZipFile(io.BytesIO(data)) as zf:
                         names = [n for n in zf.namelist() if n.lower().endswith(('.tif','.tiff'))]
-                        if names:
-                            with zf.open(names[0]) as zt, open(out_path, 'wb') as f:
-                                f.write(zt.read())
-                            return str(out_path)
+                        if not names:
+                            raise RuntimeError("ZIP sem GeoTIFF dentro.")
+                        with zf.open(names[0]) as zt, open(out_path, 'wb') as f:
+                            f.write(zt.read())
                 else:
                     with open(out_path, 'wb') as f:
                         f.write(data)
-                    return str(out_path)
+                return str(out_path)
             except Exception as e:
-                if attempt == max_retries - 1:
-                    err(f"Download falhou após {max_retries} tentativas: {e}")
-                else:
-                    time.sleep(1)
+                wait = base ** attempt
+                err(f"Download parte/tile falhou (tentativa {attempt+1}/{max_retries}): {e} — retry em {wait:.1f}s")
+                time.sleep(wait)
         return None
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(tqdm(ex.map(_dl, args), total=len(args), desc="Downloading tiles"))
+        results = list(tqdm(ex.map(_dl, args), total=len(args), desc="Downloading tiles (partes)"))
     return [r for r in results if r is not None]
 
-# ---------------------------------- Predição ----------------------------------
-def predict_tile_fast(args):
-    path_tif, roi_geom, model_data = args
+# ---------------------------------- Predição (empilhando PARTES) ----------------------------------
+def predict_tile_from_parts(args):
+    parts_paths, roi_geom, model_data = args
+    first = Path(parts_paths[0]).name
+    m = _tile_regex.search(first)
+    if m:
+        tag, tid, _ = m.groups()
+        out_tile = TMP_DIR / f"pred_feats_{tag}_t{tid}.tif"
+    else:
+        stem = Path(parts_paths[0]).stem
+        out_tile = TMP_DIR / f"pred_{stem}.tif"
+
+    if out_tile.exists() and out_tile.stat().st_size > 0:
+        return str(out_tile)
+
     try:
-        with rio.open(path_tif) as ds:
-            arr = ds.read().astype("float32")
-            height, width = ds.height, ds.width
-            transform = ds.transform
-            crs = ds.crs
+        with rio.open(parts_paths[0]) as ds0:
+            height, width = ds0.height, ds0.width
+            transform = ds0.transform
+            crs = ds0.crs
+
+        arrays = []
+        for p in parts_paths:
+            with rio.open(p) as ds:
+                arrays.append(ds.read().astype("float32"))
+        arr = np.concatenate(arrays, axis=0)  # (B_total, H, W)
 
         finite_all = np.isfinite(arr).all(axis=0)
-
         try:
             geoms_tx = [transform_geom("EPSG:4326", crs.to_string(), mapping(roi_geom), precision=6)]
             roi_m = rasterize([(g,1) for g in geoms_tx],
@@ -582,18 +593,11 @@ def predict_tile_fast(args):
         pred[~mask] = NODATA_PRED
         pred[~np.isfinite(pred)] = NODATA_PRED
 
-        out_tile = TMP_DIR / f"pred_{Path(path_tif).stem}.tif"
         prof_out = {
             "driver": "GTiff",
-            "height": H,
-            "width": W,
-            "count": 1,
-            "dtype": "float32",
-            "crs": crs,
-            "transform": transform,
-            "nodata": NODATA_PRED,
-            "compress": "deflate",
-            "photometric": "MINISBLACK"
+            "height": H, "width": W, "count": 1,
+            "dtype": "float32", "crs": crs, "transform": transform,
+            "nodata": NODATA_PRED, "compress": "deflate", "photometric": "MINISBLACK"
         }
         with rio.open(out_tile, "w", **prof_out) as dst:
             dst.write(pred, 1)
@@ -601,14 +605,28 @@ def predict_tile_fast(args):
         return str(out_tile)
 
     except Exception as e:
-        err(f"Erro predição {path_tif}: {e}")
+        err(f"Erro predição (partes) {first}: {e}")
         return None
 
-def predict_tiles_parallel(downloaded, roi_geom, M):
-    predict_args = [(f, roi_geom, M) for f in downloaded]
-    with ProcessPoolExecutor(max_workers=PROCESS_WORKERS) as executor:
-        results = list(tqdm(executor.map(predict_tile_fast, predict_args),
-                            total=len(predict_args), desc="Predicting tiles"))
+def predict_tiles_parallel_from_groups(tiles_parts_map, roi_geom, M):
+    # tiles_parts_map: {"YYYY-MM__MM.DD.AAAA_t000": [parte0, parte1, ...], ...}
+    parts_groups = list(tiles_parts_map.values())
+    args_list = [(pp, roi_geom, M) for pp in parts_groups]
+    try:
+        with ProcessPoolExecutor(max_workers=PROCESS_WORKERS) as executor:
+            results = list(
+                tqdm(
+                    executor.map(predict_tile_from_parts, args_list),
+                    total=len(args_list),
+                    desc="Predicting tiles"
+                )
+            )
+    except Exception as e:
+        err(f"Multiprocessing indisponível ({e}); caindo para execução sequencial.")
+        results = [
+            predict_tile_from_parts(a)
+            for a in tqdm(args_list, total=len(args_list), desc="Predicting tiles (1 proc)")
+        ]
     return [r for r in results if r is not None]
 
 # ---------------------------------- Visualizações ----------------------------------
@@ -617,8 +635,7 @@ def preview_png_fast(tif_path):
         with rio.open(tif_path) as ds:
             arr = ds.read(1, out_shape=(max(1, ds.height//4), max(1, ds.width//4)))
             arr = np.ma.masked_equal(arr, ds.nodata)
-        if arr.compressed().size == 0:
-            return
+        if arr.compressed().size == 0: return
         vmin, vmax = np.percentile(arr.compressed(), (5, 95))
         plt.figure(figsize=(6, 4))
         plt.imshow(arr, vmin=vmin, vmax=vmax, cmap="viridis")
@@ -633,7 +650,6 @@ def preview_png_fast(tif_path):
         err(f"Preview error: {e}")
 
 def compute_month_mean(tif_path, roi_geom):
-    """Média mensal de Chl-a (mg m^-3) sobre a ROI — no CRS nativo."""
     try:
         with rio.open(tif_path) as ds:
             arr = ds.read(1)
@@ -651,8 +667,7 @@ def compute_month_mean(tif_path, roi_geom):
         except Exception:
             roi_m = np.ones((height, width), dtype=bool)
         m = roi_m & np.isfinite(arr) & ((nodata is None) | (arr != nodata))
-        if not m.any():
-            return np.nan
+        if not m.any(): return np.nan
         return float(arr[m].mean())
     except Exception as e:
         err(f"Falha ao calcular média mensal: {e}")
@@ -676,7 +691,7 @@ def main():
     start_time = time.time()
     ee_init()
 
-    # Verificação de entradas persistentes
+    # Entradas persistentes
     if not Path(SHP_PATH).exists():
         raise FileNotFoundError(
             f"Shapefile não encontrado em {SHP_PATH}.\n"
@@ -689,7 +704,6 @@ def main():
         )
 
     def _date_tag_last_day(year, month):
-        # último dia do mês como "data" do produto (formato MM.DD.AAAA)
         last_day = monthrange(year, month)[1]
         return f"{month:02d}.{last_day:02d}.{year:04d}"
 
@@ -697,42 +711,35 @@ def main():
     roi_gdf, roi_geom, roi_bbox_ee, roi_ee = load_roi_local()
     info(f"ROI pronta: {roi_geom.bounds}")
 
-    # Modelo
+    # Modelo + nomes de features
     M = joblib.load(MODEL_PATH)
+    FEAT_NAMES = list(M["features"])
 
-    # Tiles (use TILE_DEG maior p/ menos tiles)
+    # Tiles
     rects_all = tiles_rects(roi_geom.bounds, TILE_DEG)
     rects = filter_tiles_simple(roi_geom, rects_all)
     info(f"Processando tiles de {TILE_DEG}° — total: {len(rects)}")
 
-    # Lista completa de meses-alvo (ano, mês)
     all_months = [(y, m) for y in range(START_YEAR, END_YEAR+1) for m in MONTHS_TO_PROCESS]
-
-    # Meses já processados (no Drive)
     processed = get_processed_months()
-
-    # PENDENTES na ordem cronológica
     months_pending = [(y, m) for (y, m) in all_months if (y, m) not in processed]
 
     if not months_pending:
         info("Nada a fazer — todos os meses do intervalo já estão processados.")
         return
 
-    # >>> RECORTE DO LOTE (só os próximos N meses pendentes)
     batch = months_pending[:max(1, BATCH_SIZE)]
     info(f"Lote atual (até {BATCH_SIZE} meses): {batch}")
 
     for idx, (year, month) in enumerate(batch, 1):
         ym = f"{year:04d}-{month:02d}"
-        date_tag = _date_tag_last_day(year, month)  # "MM.DD.AAAA"
+        date_tag = _date_tag_last_day(year, month)
 
-        # Pastas por ANO/MÊS no Drive
         YEAR_DIR  = DRIVE_ROOT / f"{year:04d}"
         MONTH_DIR = YEAR_DIR / f"{month:02d}"
         YEAR_DIR.mkdir(parents=True, exist_ok=True)
         MONTH_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Redefinir destinos globais para este mês
         global ART_DIR, FEATURES_DIR, TMP_DIR, PRED_DIR, PLOT_DIR
         ART_DIR      = MONTH_DIR
         FEATURES_DIR = MONTH_DIR / "features"; FEATURES_DIR.mkdir(exist_ok=True, parents=True)
@@ -743,135 +750,145 @@ def main():
         info(f"=== {ym} === ({idx}/{len(batch)})")
         info(f"Armazenando no Drive: {MONTH_DIR}")
 
-        # Arquivo final com sufixo de data (MM.DD.AAAA)
+        try:
+            marker = MONTH_DIR / f"_INDEX_{ym}.txt"
+            marker.write_text(
+                "Estrutura desta pasta (todos no Google Drive):\n"
+                f"- features: {FEATURES_DIR}\n- tmp: {TMP_DIR}\n- pred: {PRED_DIR}\n- plots: {PLOT_DIR}\n",
+                encoding="utf-8"
+            )
+        except Exception as _e:
+            err(f"Falha ao criar marcador: {_e}")
+        write_status(MONTH_DIR, "init", {"year": year, "month": month})
+
         out_final = PRED_DIR / f"amazonia_chla_{ym}__{date_tag}.tif"
         if out_final.exists():
             info(f"[{ym}] Já existe, pulando processamento.")
+            try:
+                alias = MONTH_DIR / f"LATEST_amazonia_chla_{ym}.tif"
+                if alias.exists(): alias.unlink()
+                shutil.copy2(out_final, alias)
+            except Exception as _e:
+                err(f"Cópia na raiz falhou: {_e}")
             preview_png_fast(out_final)
             mean_val = compute_month_mean(out_final, roi_geom)
             if np.isfinite(mean_val):
                 info(f"[{ym}] MÉDIA mensal Chl-a: {mean_val:.3f} mg m^-3")
                 plot_month_mean(mean_val, ym)
-            # Manifest mesmo no pulo
+            # Manifest pós-skip
             try:
+                feats_list = sorted([str(p) for p in FEATURES_DIR.glob(f"feats_{ym}__{date_tag}_t*_p*.tif")])
+                preds_list = sorted([str(p) for p in TMP_DIR.glob(f"pred_feats_{ym}__{date_tag}_t*.tif")])
                 manifest = {
                     "year": year, "month": month, "date_tag": date_tag,
                     "paths": {
-                        "features_dir": str(FEATURES_DIR),
-                        "tmp_dir":      str(TMP_DIR),
-                        "pred_dir":     str(PRED_DIR),
-                        "plots_dir":    str(PLOT_DIR),
-                        "cache_dir":    str(CACHE_DIR),
-                        "mosaic_tif":   str(out_final),
+                        "features_dir": str(FEATURES_DIR), "tmp_dir": str(TMP_DIR),
+                        "pred_dir": str(PRED_DIR), "plots_dir": str(PLOT_DIR),
+                        "cache_dir": str(CACHE_DIR), "mosaic_tif": str(out_final),
+                        "features_tiles_parts": feats_list, "predicted_tiles": preds_list
                     },
                     "params": {
                         "PAD_DAYS": PAD_DAYS, "COMPOSITE": COMPOSITE,
                         "USE_TERRA_AQUA_ADAPTIVE": USE_TERRA_AQUA_ADAPTIVE,
                         "CLEAR_THRESHOLD": CLEAR_THRESHOLD,
                     },
-                    "inputs": {
-                        "shapefile": SHP_PATH,
-                        "model": MODEL_PATH
-                    },
+                    "inputs": {"shapefile": SHP_PATH, "model": MODEL_PATH},
                     "timestamp": datetime.now().isoformat()
                 }
                 with open((MONTH_DIR / f"manifest_{ym}__{date_tag}.json"), "w", encoding="utf-8") as f:
                     json.dump(manifest, f, ensure_ascii=False, indent=2)
             except Exception as _e:
                 err(f"Manifest (pós-skip) falhou: {_e}")
+            write_status(MONTH_DIR, "merged", {"mosaic": str(out_final)})
             continue
 
         try:
-            # 1) Mosaico adaptativo + features
+            # 1) Mosaico adaptativo + features (projeção nativa MODIS)
             t0 = time.perf_counter()
-            mosaic, frac_terra = build_mosaic_month_adapt(roi_bbox_ee, year, month)
-            feats_im = build_features_image_fast(mosaic, M["features"])
-
-            # scale nativo (~463 m)
-            mosaic_proj = mosaic.projection()
+            mosaic, frac_terra, native_proj = build_mosaic_month_adapt(roi_bbox_ee, year, month)
+            feats_im = build_features_image_fast(mosaic, FEAT_NAMES).setDefaultProjection(native_proj)
             try:
-                native_scale = float(mosaic_proj.nominalScale().getInfo())
+                native_scale = float(native_proj.nominalScale().getInfo())
             except Exception:
                 native_scale = 463.3127
             info(f"[{ym}] EE mosaic+features (nativo) em {(time.perf_counter()-t0):.1f}s; scale≈{native_scale:.2f} m")
+            if native_scale > 5_000:
+                err(f"[{ym}] Aviso: scale muito grande ({native_scale:.1f} m). Cheque projeção nativa.")
 
-            # 2) Download paralelo (NATIVO; sem reprojetar no EE)
+            # 2) Download (retomável, em PARTES)
             t1 = time.perf_counter()
             tile_tag = f"{ym}__{date_tag}"
-            downloaded = download_tiles_parallel(feats_im, rects, tile_tag, native_scale, roi_ee=roi_ee)
-            info(f"[{ym}] Download: {(time.perf_counter()-t1):.1f}s; tiles OK: {len(downloaded)}")
-            if not downloaded:
-                err(f"[{ym}] Nenhum download bem-sucedido"); continue
+            _ = download_tiles_parallel(feats_im, FEAT_NAMES, rects, tile_tag, native_scale)
+            parts_all = sorted([str(p) for p in FEATURES_DIR.glob(f"feats_{tile_tag}_t*_p*.tif")])
+            tiles_parts = group_feature_parts(parts_all)
+            write_status(MONTH_DIR, "download", {"ok_parts": len(parts_all), "tiles": len(tiles_parts)})
+            info(f"[{ym}] Download partes: {(time.perf_counter()-t1):.1f}s; tiles={len(tiles_parts)}; partes={len(parts_all)}")
+            if not tiles_parts:
+                err(f"[{ym}] Nenhuma parte disponível para predição"); continue
 
-            # 3) Predição paralela
+            # 3) Predição (retomável por tile)
             t2 = time.perf_counter()
-            pred_tiles = predict_tiles_parallel(downloaded, roi_geom, M)
-            info(f"[{ym}] Predição: {(time.perf_counter()-t2):.1f}s; tiles OK: {len(pred_tiles)}")
+            _ = predict_tiles_parallel_from_groups(tiles_parts, roi_geom, M)
+            pred_tiles = sorted([str(p) for p in TMP_DIR.glob(f"pred_feats_{ym}__{date_tag}_t*.tif")])
+            write_status(MONTH_DIR, "predict", {"ok_tiles": len(pred_tiles)})
+            info(f"[{ym}] Predição: {(time.perf_counter()-t2):.1f}s; tiles previstos: {len(pred_tiles)}")
             if not pred_tiles:
-                err(f"[{ym}] Nenhuma predição bem-sucedida"); continue
+                err(f"[{ym}] Nenhum tile previsto disponível para merge"); continue
 
-            # 4) Merge final — mantém CRS NATIVO (sinusoidal)
+            # 4) Merge final — CRS nativo (sinusoidal)
             t3 = time.perf_counter()
             srcs = [rio.open(p) for p in pred_tiles]
             mosaic_arr, mosaic_trans = rio_merge(srcs, nodata=NODATA_PRED)
             native_crs = srcs[0].crs
-            for s in srcs:
-                s.close()
-
+            for s in srcs: s.close()
             meta_native = {
                 "driver": "GTiff",
-                "height": mosaic_arr.shape[1],
-                "width": mosaic_arr.shape[2],
-                "count": 1,
-                "dtype": mosaic_arr.dtype,
-                "crs": native_crs,
-                "transform": mosaic_trans,
-                "nodata": NODATA_PRED,
-                "compress": "lzw",
-                "tiled": True,
-                "photometric": "MINISBLACK",
-                "blockxsize": 256,
-                "blockysize": 256
+                "height": mosaic_arr.shape[1], "width": mosaic_arr.shape[2],
+                "count": 1, "dtype": mosaic_arr.dtype, "crs": native_crs,
+                "transform": mosaic_trans, "nodata": NODATA_PRED,
+                "compress": "lzw", "tiled": True, "photometric": "MINISBLACK",
+                "blockxsize": 256, "blockysize": 256
             }
             with rio.open(out_final, "w", **meta_native) as dst:
                 dst.write(mosaic_arr[0], 1)
             info(f"[{ym}] Merge (nativo): {(time.perf_counter()-t3):.1f}s")
 
-            # 5) SEM LIMPEZA — mantém downloads, tiles previstos e mosaico final.
-
-            # Visual e média mensal
+            # 5) Visual e média
             preview_png_fast(out_final)
             mean_val = compute_month_mean(out_final, roi_geom)
             if np.isfinite(mean_val):
                 info(f"[{ym}] MÉDIA mensal Chl-a: {mean_val:.3f} mg m^-3")
                 plot_month_mean(mean_val, ym)
 
-            # Manifest final
+            # 6) Cópia na raiz e manifest
             try:
-                feats_list = sorted([str(p) for p in FEATURES_DIR.glob(f"feats_{ym}__{date_tag}_t*.tif")])
+                alias = MONTH_DIR / f"LATEST_amazonia_chla_{ym}.tif"
+                if alias.exists(): alias.unlink()
+                shutil.copy2(out_final, alias)
+                info(f"[{ym}] Cópia na raiz do mês: {alias.name}")
+            except Exception as _e:
+                err(f"Cópia na raiz falhou: {_e}")
+
+            try:
+                feats_list = sorted([str(p) for p in FEATURES_DIR.glob(f"feats_{ym}__{date_tag}_t*_p*.tif")])
                 preds_list = sorted([str(p) for p in TMP_DIR.glob(f"pred_feats_{ym}__{date_tag}_t*.tif")])
                 manifest = {
                     "year": year, "month": month, "date_tag": date_tag,
                     "paths": {
-                        "features_dir": str(FEATURES_DIR),
-                        "tmp_dir":      str(TMP_DIR),
-                        "pred_dir":     str(PRED_DIR),
-                        "plots_dir":    str(PLOT_DIR),
-                        "cache_dir":    str(CACHE_DIR),
-                        "mosaic_tif":   str(out_final),
-                        "features_tiles": feats_list,
-                        "predicted_tiles": preds_list
+                        "features_dir": str(FEATURES_DIR), "tmp_dir": str(TMP_DIR),
+                        "pred_dir": str(PRED_DIR), "plots_dir": str(PLOT_DIR),
+                        "cache_dir": str(CACHE_DIR), "mosaic_tif":   str(out_final),
+                        "features_tiles_parts": feats_list, "predicted_tiles": preds_list
                     },
                     "params": {
                         "PAD_DAYS": PAD_DAYS, "COMPOSITE": COMPOSITE,
                         "USE_TERRA_AQUA_ADAPTIVE": USE_TERRA_AQUA_ADAPTIVE,
                         "CLEAR_THRESHOLD": CLEAR_THRESHOLD,
-                        "native_scale_m": native_scale
+                        "native_scale_m": native_scale,
+                        "tile_deg": TILE_DEG,
+                        "max_bands_per_dl": MAX_BANDS_PER_DL
                     },
-                    "inputs": {
-                        "shapefile": SHP_PATH,
-                        "model": MODEL_PATH
-                    },
+                    "inputs": {"shapefile": SHP_PATH, "model": MODEL_PATH},
                     "timestamp": datetime.now().isoformat()
                 }
                 with open((MONTH_DIR / f"manifest_{ym}__{date_tag}.json"), "w", encoding="utf-8") as f:
@@ -879,6 +896,8 @@ def main():
                 info(f"Manifest salvo.")
             except Exception as _e:
                 err(f"Manifest falhou: {_e}")
+
+            write_status(MONTH_DIR, "merged", {"mosaic": str(out_final)})
 
         except Exception as e:
             err(f"[{ym}] Erro: {e}")
