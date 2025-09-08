@@ -92,7 +92,7 @@ def _ensure_from_legacy(src: Path, dst: Path):
 START_YEAR = 2001
 END_YEAR   = 2024
 MONTHS_TO_PROCESS = list(range(1, 13))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "3"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "999"))
 
 PAD_DAYS   = 2
 COMPOSITE  = "median"
