@@ -1,0 +1,241 @@
+# ============================================================
+# Análises temporais sobre as predições mensais (GeoTIFFs)
+# - Série temporal da média espacial (e estatísticas)
+# - Boxplots por mês (climatologia) e anual (opcional)
+# - Tendência: Mann-Kendall sazonal, Theil–Sen, OLS (HAC)
+# - Decomposição STL, anomalias, ACF, histograma
+# - Lê rasters do Google Drive (pipeline MODIS nativo) e salva CSV/figuras no Drive
+# ============================================================
+
+# Dependências
+!pip -q install numpy pandas rasterio statsmodels pymannkendall matplotlib scipy
+
+import os, re, glob, math, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import rasterio as rio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from datetime import datetime
+from statsmodels.tsa.seasonal import STL
+import statsmodels.api as sm
+import pymannkendall as mk
+from statsmodels.graphics.tsaplots import plot_acf
+from scipy.stats import theilslopes
+
+warnings.filterwarnings("ignore")
+
+# ---------------- Config (Drive) ----------------
+DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts"))
+OUT_DIR    = DRIVE_ROOT / "analysis_plots"; OUT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_OUT    = OUT_DIR / "monthly_stats_timeseries.csv"
+NODATA     = -9999.0
+
+# (Opcional) Boxplot anual da distribuição das médias espaciais
+DO_YEARLY_SPATIAL_BOXPLOTS = False
+
+# ---------------- Localizador de arquivos (recursivo no Drive) ----------------
+LATEST_RE = re.compile(r".*/pred/LATEST_amazonia_chla_(\d{4})-(\d{2})\.tif$")
+FINAL_RE  = re.compile(r".*/pred/amazonia_chla_(\d{4})-(\d{2})__\d{2}\.\d{2}\.\d{4}\.tif$")
+
+def find_monthly_files_recursively(drive_root: Path):
+    """
+    Varre DRIVE_ROOT por rasters mensais no padrão do pipeline.
+    Prioriza LATEST_* e usa os finais com __MM.DD.AAAA quando não houver LATEST.
+    Retorna lista [(ano, mês, caminho)] única por (ano,mês), ordenada.
+    """
+    rasters = []
+    # LATEST primeiro
+    for p in drive_root.rglob("pred/LATEST_amazonia_chla_*.tif"):
+        s = str(p)
+        m = LATEST_RE.match(s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            rasters.append((y, mo, s))
+    # Finais com tag de data (sem duplicar meses já cobertos por LATEST)
+    for p in drive_root.rglob("pred/amazonia_chla_*__*.tif"):
+        s = str(p)
+        m = FINAL_RE.match(s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            if not any((yy == y and mm == mo) for (yy, mm, _) in rasters):
+                rasters.append((y, mo, s))
+    rasters.sort(key=lambda t: (t[0], t[1], t[2]))
+    return rasters
+
+def parse_year_month_from_name(name: str):
+    m = re.search(r"(\d{4})-(\d{2})", name)
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    return y, mo
+
+def read_valid_array(path, band=1, nodata=NODATA):
+    with rio.open(path) as ds:
+        a = ds.read(band).astype("float64")
+        nd = ds.nodata if ds.nodata is not None else nodata
+    m = (a != nd) & np.isfinite(a)
+    return a[m]
+
+# ---------------- Coleta estatísticas mensais (espaciais) ----------------
+records = find_monthly_files_recursively(DRIVE_ROOT)
+if not records:
+    raise RuntimeError(f"Nenhum GeoTIFF mensal encontrado em {DRIVE_ROOT} "
+                       f"(esperado: */pred/LATEST_amazonia_chla_YYYY-MM.tif ou amazonia_chla_YYYY-MM__*.tif).")
+
+print(f"[INFO] {len(records)} rasters detectados:")
+for y, m, f in records[:8]:
+    print(f"  {y}-{m:02d}: {Path(f).name}")
+if len(records) > 8:
+    print(f"  ... e mais {len(records)-8} itens")
+
+rows = []
+for (_y, _m, fp) in records:
+    ym = parse_year_month_from_name(Path(fp).name)
+    if ym is None:
+        continue
+    y, m = ym
+    v = read_valid_array(fp, nodata=NODATA)
+    if v.size == 0:
+        continue
+    rows.append({
+        "date": pd.Timestamp(year=y, month=m, day=1),
+        "year": y, "month": m,
+        "mean": float(np.mean(v)),
+        "median": float(np.median(v)),
+        "std": float(np.std(v, ddof=0)),
+        "p10": float(np.percentile(v, 10)),
+        "p25": float(np.percentile(v, 25)),
+        "p50": float(np.percentile(v, 50)),
+        "p75": float(np.percentile(v, 75)),
+        "p90": float(np.percentile(v, 90)),
+        "n_valid": int(v.size),
+        "src": fp
+    })
+
+if not rows:
+    raise RuntimeError("Nenhuma estatística computada (verifique nodata/arquivos).")
+
+df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+df.to_csv(CSV_OUT, index=False)
+print(f"[OK] Estatísticas mensais salvas em: {CSV_OUT}")
+
+# Série principal (média espacial mensal)
+ts = df.set_index("date")["mean"].asfreq("MS")  # Monthly Start
+# Prevenção: gaps → interpolação leve para gráficos/ACF/STL
+ts_interp = ts.interpolate(limit_direction="both")
+
+# ---------------- Gráfico 1: Série temporal da média (rolling) ----------------
+plt.figure(figsize=(11,4.5))
+plt.plot(ts.index, ts.values, lw=1.5, label="Monthly spatial mean")
+plt.plot(ts_interp.index, ts_interp.rolling(3, center=True).mean(), lw=2.0, label="3-mo rolling mean")
+plt.xlabel("Date"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Amazon — Monthly spatial mean chlorophyll-a")
+plt.grid(alpha=0.25); plt.legend()
+plt.tight_layout(); plt.savefig(OUT_DIR / "ts_mean_rolling.png", dpi=160); plt.close()
+
+# ---------------- Tendência: MK sazonal + Theil–Sen + OLS ----------------
+# MK sazonal (remove NaN)
+ts_mk = ts.dropna()
+try:
+    mk_res = mk.seasonal_test(ts_mk.values, period=12)
+except Exception:
+    mk_res = mk.original_test(ts_mk.values)
+
+# Theil–Sen sobre série interpolada
+t_years = (ts_interp.index.year + (ts_interp.index.dayofyear - 1)/365.25).astype(float)
+X = t_years
+Y = ts_interp.values
+theta = theilslopes(Y, X, 0.95)
+sen_slope = theta[0]    # µg/L por ano
+sen_inter = theta[1]
+
+# OLS (HAC Newey-West)
+X_ols = sm.add_constant(X)
+ols = sm.OLS(Y, X_ols).fit(cov_type="HAC", cov_kwds={"maxlags":12})
+ols_slope = float(ols.params[1])
+ols_p     = float(ols.pvalues[1])
+
+print("\n===== Trend Summary =====")
+print(f"Mann–Kendall seasonal: trend={mk_res.trend}, p={mk_res.p:.4f}, tau={mk_res.Tau:.3f}")
+print(f"Theil–Sen slope: {sen_slope:.3f} µg/L/yr (95% CI approx. via theilslopes)")
+print(f"OLS slope: {ols_slope:.3f} µg/L/yr (p={ols_p:.4f})")
+
+# Gráfico OLS
+plt.figure(figsize=(11,4.5))
+plt.plot(ts.index, ts.values, lw=1.2, label="Monthly spatial mean")
+y_fit = ols.params[0] + ols.params[1] * X
+plt.plot(ts.index, y_fit, lw=2.0, label=f"OLS trend ({ols_slope:.2f} µg/L/yr, p={ols_p:.3f})")
+plt.xlabel("Date"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Trend analysis — OLS trend line")
+plt.grid(alpha=0.25); plt.legend()
+plt.tight_layout(); plt.savefig(OUT_DIR / "ts_trend_ols.png", dpi=160); plt.close()
+
+# ---------------- Decomposição STL ----------------
+stl = STL(ts_interp, period=12, robust=True).fit()
+plt.figure(figsize=(11,7))
+ax = plt.subplot(4,1,1); ax.plot(stl.observed); ax.set_title("Observed"); ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,2); ax.plot(stl.trend);    ax.set_title("Trend");    ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,3); ax.plot(stl.seasonal); ax.set_title("Seasonal"); ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,4); ax.plot(stl.resid);    ax.set_title("Residual"); ax.grid(alpha=0.2)
+plt.tight_layout(); plt.savefig(OUT_DIR / "stl_decomposition.png", dpi=160); plt.close()
+
+# ---------------- Boxplot por mês (climatologia das médias espaciais) ----------------
+df_m = df.copy()
+df_m["mon"] = df_m["date"].dt.month
+order = range(1,13)
+plt.figure(figsize=(12,5))
+data_by_month = [df_m.loc[df_m["mon"]==m, "mean"].values for m in order]
+plt.boxplot(data_by_month, labels=[datetime(2001, m, 1).strftime("%b") for m in order], showfliers=False)
+plt.xlabel("Month"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Monthly distribution of spatial means (climatological boxplot)")
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout(); plt.savefig(OUT_DIR / "boxplot_monthly_means_by_month.png", dpi=160); plt.close()
+
+# ---------------- (Opcional) Boxplot anual ----------------
+if DO_YEARLY_SPATIAL_BOXPLOTS:
+    df_y = df.copy()
+    years_sorted = sorted(df_y["year"].unique().tolist())
+    plt.figure(figsize=(12,5))
+    data_by_year = [df_y.loc[df_y["year"]==yy, "mean"].values for yy in years_sorted]
+    plt.boxplot(data_by_year, labels=[str(y) for y in years_sorted], showfliers=False)
+    plt.xlabel("Year"); plt.ylabel("Chl-a (µg/L)")
+    plt.title("Yearly distribution of spatial means (boxplot)")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout(); plt.savefig(OUT_DIR / "boxplot_yearly_means.png", dpi=160); plt.close()
+
+# ---------------- Anomalias e heatmap ano×mês ----------------
+clim = df.groupby("month")["mean"].mean()
+df["anomaly"] = df.apply(lambda r: r["mean"] - clim.loc[r["month"]], axis=1)
+mat = df.pivot(index="year", columns="month", values="anomaly").sort_index()
+years = mat.index.values; months = mat.columns.values
+plt.figure(figsize=(12,5))
+vmax = np.nanmax(np.abs(mat.values))
+im = plt.imshow(mat.values, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+plt.colorbar(im, label="Anomaly (µg/L)")
+plt.yticks(ticks=np.arange(len(years)), labels=years)
+plt.xticks(ticks=np.arange(len(months)), labels=[datetime(2001, m, 1).strftime("%b") for m in months], rotation=0)
+plt.title("Monthly anomalies of spatial mean (year × month)")
+plt.tight_layout(); plt.savefig(OUT_DIR / "heatmap_anomalies_year_month.png", dpi=160); plt.close()
+
+# ---------------- ACF ----------------
+fig = plt.figure(figsize=(8,4))
+plot_acf(ts_interp.dropna(), lags=36, ax=plt.gca())
+plt.title("Autocorrelation of monthly spatial mean (ACF)")
+plt.tight_layout(); plt.savefig(OUT_DIR / "acf_monthly_mean.png", dpi=160); plt.close()
+
+# ---------------- Histograma ----------------
+plt.figure(figsize=(8,4))
+plt.hist(df["mean"].values, bins=25, edgecolor="k", alpha=0.7)
+plt.xlabel("Chl-a (µg/L) — monthly spatial mean"); plt.ylabel("Frequency")
+plt.title("Distribution of monthly spatial means")
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout(); plt.savefig(OUT_DIR / "hist_monthly_means.png", dpi=160); plt.close()
+
+print(f"\n[OK] Figuras salvas em: {OUT_DIR}")
+print("Arquivos gerados:")
+for p in sorted(OUT_DIR.glob("*.png")):
+    print(" -", p)
+print(" -", CSV_OUT)
