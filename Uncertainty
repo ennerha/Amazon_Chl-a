@@ -1,0 +1,286 @@
+# ============================================================
+# Mapas de incerteza por pixel (Drive -> pipeline MODIS nativo)
+# - Lê rasters mensais diretamente de DRIVE_ROOT/**/pred/
+#   * prefere LATEST_amazonia_chla_YYYY-MM.tif
+#   * fallback: amazonia_chla_YYYY-MM__MM.DD.AAAA.tif
+# - STD, MAD (robusto), Bootstrap SE e PI95-width (do mean),
+#   MAA (Mean Absolute Anomaly) vs climatologia mensal local
+# - Processamento em janelas (RAM-eficiente)
+# ============================================================
+
+import os, re, math, glob, warnings
+from pathlib import Path
+import numpy as np
+import rasterio as rio
+from rasterio.windows import Window
+from rasterio.plot import plotting_extent
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+# ---------------- Config (Drive + desempenho) ----------------
+DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts"))
+OUT_DIR    = DRIVE_ROOT / "uncertainty_maps"; OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Bootstrap
+B_BOOT   = int(os.environ.get("B_BOOT", "200"))   # 500/1000 se quiser mais precisão
+RNG_SEED = int(os.environ.get("RNG_SEED", "42"))
+rng      = np.random.default_rng(RNG_SEED)
+
+# Janelas (processamento em blocos)
+WIN_SIZE = int(os.environ.get("WIN_SIZE", "512"))  # 512/1024 costumam caber em RAM
+DEFAULT_NODATA = -9999.0
+
+# Saídas
+STD_TIF  = OUT_DIR / "unc_std.tif"
+MAD_TIF  = OUT_DIR / "unc_mad_scaled.tif"
+SE_TIF   = OUT_DIR / "unc_boot_se_mean.tif"
+PIW_TIF  = OUT_DIR / "unc_boot_pi95_width.tif"
+MAA_TIF  = OUT_DIR / "unc_mean_abs_anomaly.tif"  # relativo à climatologia mensal local
+
+# ---------------- Localizador de arquivos (recursivo no Drive) ----------------
+LATEST_RE = re.compile(r".*/pred/LATEST_amazonia_chla_(\d{4})-(\d{2})\.tif$")
+FINAL_RE  = re.compile(r".*/pred/amazonia_chla_(\d{4})-(\d{2})__\d{2}\.\d{2}\.\d{4}\.tif$")
+
+def find_monthly_files_recursively(drive_root: Path):
+    """
+    Varre DRIVE_ROOT por rasters mensais no padrão do pipeline.
+    Dá preferência ao LATEST_*, e usa o final __MM.DD.AAAA se não houver LATEST.
+    Retorna lista [(ano, mês, caminho)], ordenada por (ano, mês).
+    """
+    rasters = []
+    # 1) LATEST primeiro (um por (ano, mês))
+    for p in drive_root.rglob("pred/LATEST_amazonia_chla_*.tif"):
+        s = str(p)
+        m = LATEST_RE.match(s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            rasters.append((y, mo, s))
+    # 2) Arquivos finais com data-tag (sem duplicar meses já cobertos por LATEST)
+    for p in drive_root.rglob("pred/amazonia_chla_*__*.tif"):
+        s = str(p)
+        m = FINAL_RE.match(s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            if not any((yy == y and mm == mo) for (yy, mm, _) in rasters):
+                rasters.append((y, mo, s))
+    rasters.sort(key=lambda t: (t[0], t[1], t[2]))
+    return rasters
+
+def monthly_index_from_path(fp: str):
+    """Extrai mês (1-12) do nome amazonia_chla_YYYY-MM*.tif"""
+    m = re.search(r"(\d{4})-(\d{2})", Path(fp).name)
+    return int(m.group(2)) if m else None
+
+# ---------------- Utilitários raster ----------------
+def open_reference(files):
+    """
+    Abre o primeiro arquivo como referência. Garante nodata e perfil base.
+    """
+    with rio.open(files[0]) as ref:
+        profile   = ref.profile.copy()
+        height    = ref.height
+        width     = ref.width
+        nodata    = ref.nodata if ref.nodata is not None else DEFAULT_NODATA
+        transform = ref.transform
+        crs       = ref.crs
+    return profile, height, width, nodata, transform, crs
+
+def iter_windows(width, height, win=WIN_SIZE):
+    for row in range(0, height, win):
+        h = min(win, height - row)
+        for col in range(0, width, win):
+            w = min(win, width - col)
+            yield Window(col_off=col, row_off=row, width=w, height=h)
+
+def read_stack_window(files, window, nodata, ref_shape=None, ref_transform=None):
+    """
+    Lê uma janela (window) de todos os arquivos e retorna um array (T, h, w) com NaN nos nodata.
+    Se algum arquivo tiver grade diferente da referência, ele é ignorado (log leve).
+    """
+    arrs = []
+    for fp in files:
+        try:
+            with rio.open(fp) as ds:
+                # valida grade
+                if (ref_shape is not None and (ds.height, ds.width) != ref_shape) or \
+                   (ref_transform is not None and ds.transform != ref_transform):
+                    # pular rasters fora da grade padrão (incomuns, mas seguros)
+                    continue
+                a = ds.read(1, window=window).astype(np.float32)
+                nd = ds.nodata if ds.nodata is not None else nodata
+                a = np.where((a == nd) | ~np.isfinite(a), np.nan, a)
+                arrs.append(a)
+        except Exception as e:
+            print(f"[AVISO] Falha ao ler window de {fp}: {e}")
+    if not arrs:
+        # janela sem dados (ex.: todos divergentes de grade) -> retorna NaNs
+        return np.full((0, int(window.height), int(window.width)), np.nan, dtype=np.float32)
+    stack = np.stack(arrs, axis=0)  # (T, h, w)
+    return stack
+
+# ---------------- Estatísticas ----------------
+def mad_scaled(x, axis=0):
+    """
+    Median Absolute Deviation escalado (x1.4826) ≈ σ sob normalidade. Ignora NaN.
+    """
+    med = np.nanmedian(x, axis=axis)
+    mad = np.nanmedian(np.abs(x - np.expand_dims(med, axis=axis)), axis=axis)
+    return 1.4826 * mad
+
+def bootstrap_stats(x, B=B_BOOT, rng=rng):
+    """
+    Bootstrap temporal por pixel:
+      x: série (T,) com NaNs
+    Retorna:
+      se_mean  -> erro-padrão do mean via bootstrap
+      piw95    -> largura do intervalo de 95% (p97.5 - p2.5) das médias bootstrap
+    """
+    x_valid = x[np.isfinite(x)]
+    n = x_valid.size
+    if n < 3:
+        return np.nan, np.nan
+    idx = rng.integers(0, n, size=(B, n), endpoint=False)
+    bs = x_valid[idx]                 # (B, n)
+    means = np.nanmean(bs, axis=1)   # (B,)
+    se_mean = np.nanstd(means, ddof=1)
+    q2, q97 = np.nanpercentile(means, [2.5, 97.5])
+    return float(se_mean), float(q97 - q2)
+
+# ---------------- Descoberta & preparação ----------------
+records = find_monthly_files_recursively(DRIVE_ROOT)
+if not records:
+    raise RuntimeError(f"Nenhum GeoTIFF mensal encontrado em {DRIVE_ROOT} "
+                       f"(esperado: */pred/LATEST_amazonia_chla_YYYY-MM.tif ou amazonia_chla_YYYY-MM__*.tif).")
+
+files = [fp for (_, _, fp) in records]
+months_list = [monthly_index_from_path(fp) for fp in files]
+
+print(f"[INFO] {len(files)} imagens detectadas em {DRIVE_ROOT} (únicas por mês/ano; LATEST priorizado).")
+for y, m, f in records[:8]:
+    print(f"  {y}-{m:02d}: {Path(f).name}")
+if len(records) > 8:
+    print(f"  ... e mais {len(records)-8} itens")
+
+# Perfil e grade de referência
+profile, H, W, nodata, transform, crs = open_reference(files)
+print(f"[INFO] Grade de referência: {W}x{H} | CRS={crs} | nodata={nodata}")
+
+# Preparar rasters de saída
+prof_out = profile.copy()
+prof_out.update(dtype="float32", count=1, nodata=DEFAULT_NODATA, compress="deflate")
+
+dst_std = rio.open(STD_TIF, "w", **prof_out)
+dst_mad = rio.open(MAD_TIF, "w", **prof_out)
+dst_se  = rio.open(SE_TIF,  "w", **prof_out)
+dst_piw = rio.open(PIW_TIF, "w", **prof_out)
+dst_maa = rio.open(MAA_TIF, "w", **prof_out)
+
+# ---------------- Loop principal em janelas ----------------
+try:
+    for win in iter_windows(W, H, WIN_SIZE):
+        stack = read_stack_window(files, win, nodata, ref_shape=(H, W), ref_transform=transform)  # (T, h, w) ou (0,h,w)
+        if stack.shape[0] == 0:
+            # nada válido nesta janela
+            h, w = int(win.height), int(win.width)
+            dst_std.write(np.full((h, w), np.nan, np.float32), 1, window=win)
+            dst_mad.write(np.full((h, w), np.nan, np.float32), 1, window=win)
+            dst_se.write (np.full((h, w), np.nan, np.float32), 1, window=win)
+            dst_piw.write(np.full((h, w), np.nan, np.float32), 1, window=win)
+            dst_maa.write(np.full((h, w), np.nan, np.float32), 1, window=win)
+            print(f"[INFO] janela sem dados úteis: r={win.row_off}:{win.row_off+win.height} c={win.col_off}:{win.col_off+win.width}")
+            continue
+
+        T, h, w = stack.shape
+
+        # STD temporal (σ)
+        std_win = np.nanstd(stack, axis=0, ddof=1)  # (h, w)
+
+        # MAD escalado (≈ σ robusto)
+        mad_win = mad_scaled(stack, axis=0)         # (h, w)
+
+        # Climatologia mensal local (média por mês no pixel) -> MAA
+        # Pré-agrega por mês para reduzir passes
+        months_arr = np.array(months_list, dtype=np.int16)
+        clim_means = {}
+        for mo in range(1, 13):
+            mask_t = (months_arr == mo)
+            if np.any(mask_t):
+                clim_means[mo] = np.nanmean(stack[mask_t, :, :], axis=0)
+
+        abs_anoms_acc = np.zeros((h, w), dtype=np.float64)
+        count_valid   = np.zeros((h, w), dtype=np.int32)
+        for t in range(T):
+            mo = months_arr[t]
+            clim = clim_means.get(mo, None)
+            if clim is None:
+                continue
+            x = stack[t, :, :]
+            diff = np.abs(x - clim)
+            mval = np.isfinite(diff)
+            abs_anoms_acc[mval] += diff[mval]
+            count_valid[mval]   += 1
+        maa_win = np.where(count_valid > 0, abs_anoms_acc / np.maximum(count_valid, 1), np.nan).astype(np.float32)
+
+        # Bootstrap por pixel (SE e PI95-width do mean)
+        se_win  = np.full((h, w), np.nan, dtype=np.float32)
+        piw_win = np.full((h, w), np.nan, dtype=np.float32)
+
+        # Varre linha a linha para reduzir overhead
+        for i in range(h):
+            series_block = stack[:, i, :]  # (T, w)
+            # Processa cada coluna
+            for j in range(w):
+                x = series_block[:, j]
+                if np.isfinite(x).sum() >= 3:
+                    se, piw = bootstrap_stats(x, B=B_BOOT, rng=rng)
+                    se_win[i, j]  = se
+                    piw_win[i, j] = piw
+
+        # Escreve janelas
+        dst_std.write(std_win.astype(np.float32), 1, window=win)
+        dst_mad.write(mad_win.astype(np.float32), 1, window=win)
+        dst_se.write(se_win,   1, window=win)
+        dst_piw.write(piw_win, 1, window=win)
+        dst_maa.write(maa_win, 1, window=win)
+
+        print(f"[INFO] janela escrita: r={win.row_off}:{win.row_off+win.height} c={win.col_off}:{win.col_off+win.width}")
+
+finally:
+    dst_std.close()
+    dst_mad.close()
+    dst_se.close()
+    dst_piw.close()
+    dst_maa.close()
+
+print("\n[OK] Mapas salvos em:")
+print(" -", STD_TIF,  "   (STD temporal)")
+print(" -", MAD_TIF,  "   (MAD escalado ≈ σ robusto)")
+print(" -", SE_TIF,   "   (Bootstrap SE do mean)")
+print(" -", PIW_TIF,  "   (Bootstrap PI95 width do mean)")
+print(" -", MAA_TIF,  "   (Mean Absolute Anomaly vs climatologia mensal local)")
+
+# ---------------- Previews rápidos (salvos em PNG no Drive) ----------------
+def preview_to_png(tif_path: Path, title: str, out_png: Path, cmap="viridis"):
+    with rio.open(tif_path) as ds:
+        arr = ds.read(1, masked=True)
+        ext = plotting_extent(ds)
+    v = arr.compressed()
+    vmin, vmax = (np.percentile(v, (2,98)) if v.size else (0,1))
+    plt.figure(figsize=(8,6))
+    plt.imshow(arr, extent=ext, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    plt.title(title); plt.xticks([]); plt.yticks([])
+    cbar = plt.colorbar(); cbar.set_label("mg m$^{-3}$")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+preview_to_png(STD_TIF, "STD (temporal variability)", OUT_DIR / "preview_unc_std.png")
+preview_to_png(MAD_TIF, "MAD scaled (robust sigma)", OUT_DIR / "preview_unc_mad_scaled.png")
+preview_to_png(SE_TIF,  "Bootstrap SE (mean)",       OUT_DIR / "preview_unc_boot_se_mean.png")
+preview_to_png(PIW_TIF, "Bootstrap PI95 width",      OUT_DIR / "preview_unc_boot_pi95_width.png")
+preview_to_png(MAA_TIF, "Mean Absolute Anomaly",     OUT_DIR / "preview_unc_mean_abs_anomaly.png")
+
+print("\n[OK] Previews salvos em PNG no Drive:", OUT_DIR)
