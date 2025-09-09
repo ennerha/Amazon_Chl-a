@@ -1,0 +1,336 @@
+# ============================================================
+# Clorofila-a — Figuras "inteligentes" (Amazônia Legal, por lago)
+# - Integra Drive (DRIVE_ROOT/inputs/stations.xlsx)
+# - Filtra por UFs da Amazônia Legal
+# - Gera figuras e estatísticas por corpo d'água (lake_name)
+# - X significativo: DATA e ANO; violino por ano; boxplot; histograma
+# - Matplotlib puro (robusto p/ Colab/Notebook, sem UI interativa)
+# ============================================================
+
+# 0) Configurações principais (ajuste se quiser)
+import os, re, unicodedata
+from pathlib import Path
+
+DRIVE_ROOT       = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts"))
+INPUTS_DIR       = DRIVE_ROOT / "inputs"
+XLSX_PATH        = INPUTS_DIR / "stations.xlsx"      # fonte única Amazon-wide
+FORCE_CHLA_COL   = None                               # ex.: "chla_ugL" (None = auto)
+FORCE_DATE_COL   = None                               # ex.: "date" (None = auto)
+REMOVE_OUTLIERS  = True                               # IQR 1.5*IQR
+LOG_SCALE_Y      = False
+HIST_LOGX        = False
+FIG_DPI          = 180
+SEED             = 42
+
+# Filtragem Amazônia Legal (UFs)
+AMAZON_STATES = {"AC","AM","AP","PA","RO","RR","TO","MA","MT"}
+
+# Saídas
+OUT_ROOT = DRIVE_ROOT / "figures" / "stations"
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+# 1) Imports científicos
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+np.random.seed(SEED)
+
+# 2) Utilidades ----------------------------
+def _savefig(fig, path, dpi=FIG_DPI):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] {path}")
+
+def _norm(s: str) -> str:
+    s = str(s or "")
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = s.strip()
+    return s
+
+def _slug(s: str) -> str:
+    s = _norm(s).lower()
+    s = re.sub(r"[^a-z0-9]+","-",s)
+    return s.strip("-") or "sem_nome"
+
+def _apply_common(ax, title, ylabel="Chl-a", logy=False):
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("")
+    if logy:
+        ax.set_yscale("log")
+    ax.grid(True, alpha=0.25)
+
+def _remove_outliers_iqr(series: pd.Series, k=1.5):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.size < 4:
+        return s
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    lo, hi = q1 - k*iqr, q3 + k*iqr
+    return s[(s >= lo) & (s <= hi)]
+
+def _pick_chla_col(df: pd.DataFrame) -> str:
+    if FORCE_CHLA_COL and FORCE_CHLA_COL in df.columns:
+        return FORCE_CHLA_COL
+    preferred = [
+        "chla_mg_m3","chla_mgm3","chla_mgL","chla_ugL","chl_a","chl-a",
+        "chlorophyll_a","chlorophyll-a","clorofila_a","clorofila-a","chla","chlorophyll","clorofila"
+    ]
+    cand = [c for c in df.columns if any(k in str(c).lower() for k in ["chl","clor","chlor"])]
+    for p in preferred:
+        for c in cand:
+            if str(c).lower() == p.lower():
+                return c
+    if cand:
+        def _score(c):
+            s = str(c).lower(); sc = 0
+            if "mg" in s and ("m3" in s or "/m3" in s): sc += 3
+            if "ug" in s or "µg" in s: sc += 2
+            if any(k in s for k in ["chl","chlor","clor"]): sc += 2
+            if "mean" in s or "media" in s: sc += 1
+            return sc
+        return sorted(cand, key=_score, reverse=True)[0]
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols:
+        var = df[num_cols].var(numeric_only=True).fillna(0)
+        return var.sort_values(ascending=False).index[0]
+    raise RuntimeError("Não encontrei coluna de clorofila adequada.")
+
+def _pick_date_col(df: pd.DataFrame):
+    if FORCE_DATE_COL and FORCE_DATE_COL in df.columns:
+        return FORCE_DATE_COL
+    candidates = [c for c in df.columns if any(k in str(c).lower() for k in ["date","data","datetime","time","timestamp"])]
+    if candidates:
+        return candidates[0]
+    cols = [str(c).lower() for c in df.columns]
+    if any(c in cols for c in ["ano","year"]) and any(c in cols for c in ["mes","month"]):
+        return None
+    return None
+
+def _desc_stats(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return pd.Series({"n":0,"min":np.nan,"q25":np.nan,"median":np.nan,"mean":np.nan,
+                          "q75":np.nan,"max":np.nan,"std":np.nan,"iqr":np.nan,"cv_%":np.nan,"gmean":np.nan})
+    q25 = s.quantile(0.25); q75 = s.quantile(0.75); iqr = q75 - q25
+    std = s.std(ddof=1); mean = s.mean(); cv = (std/mean*100.0) if mean != 0 else np.nan
+    gmean = float(np.exp(np.log(s[s>0]).mean())) if (s>0).any() else np.nan
+    return pd.Series({"n":int(s.size),"min":s.min(),"q25":q25,"median":s.median(),"mean":mean,
+                      "q75":q75,"max":s.max(),"std":std,"iqr":iqr,"cv_%":cv,"gmean":gmean})
+
+# 3) Leitura do Excel Amazon-wide ----------------------------
+if not XLSX_PATH.exists():
+    raise FileNotFoundError(f"Excel não encontrado: {XLSX_PATH}")
+
+xls = pd.ExcelFile(XLSX_PATH)
+frames = []
+for sh in xls.sheet_names:
+    try:
+        df_sh = pd.read_excel(XLSX_PATH, sheet_name=sh)
+        df_sh["__sheet__"] = sh
+        frames.append(df_sh)
+    except Exception as e:
+        print(f"[WARN] Falha ao ler aba '{sh}': {e}")
+
+if not frames:
+    raise RuntimeError("Não consegui ler nenhuma planilha do Excel.")
+
+df_all = pd.concat(frames, ignore_index=True)
+df_all.columns = [str(c).strip() for c in df_all.columns]
+
+# 4) Filtrar Amazônia Legal por UF ----------------------------
+if "state" not in df_all.columns:
+    raise RuntimeError("A planilha precisa conter a coluna 'state' (UF).")
+df_all["state"] = df_all["state"].astype(str).str.upper().str.strip()
+df_amz = df_all[df_all["state"].isin(AMAZON_STATES)].copy()
+if df_amz.empty:
+    raise RuntimeError("Sem linhas da Amazônia Legal após o filtro por UF.")
+
+# 5) Preparar colunas essenciais ------------------------------
+# Nome do corpo d'água
+name_col = "lake_name" if "lake_name" in df_amz.columns else None
+if name_col is None:
+    # tenta compor um identificador
+    df_amz["lake_name"] = (df_amz.get("system", "")).astype(str).where(df_amz.get("system").notna(), "Unknown")
+    name_col = "lake_name"
+
+# Clorofila
+chla_col = _pick_chla_col(df_amz)
+df_amz["_chl"] = pd.to_numeric(df_amz[chla_col], errors="coerce")
+
+# Datas
+date_col = _pick_date_col(df_amz)
+if date_col:
+    df_amz["_date"] = pd.to_datetime(df_amz[date_col], errors="coerce")
+else:
+    yr = next((c for c in df_amz.columns if str(c).lower() in ["ano","year"]), None)
+    mo = next((c for c in df_amz.columns if str(c).lower() in ["mes","month"]), None)
+    dy = next((c for c in df_amz.columns if str(c).lower() in ["dia","day"]), None)
+    if yr is not None and mo is not None:
+        _dparts = {"year": pd.to_numeric(df_amz[yr], errors="coerce"),
+                   "month": pd.to_numeric(df_amz[mo], errors="coerce"),
+                   "day": pd.to_numeric(df_amz[dy], errors="coerce") if dy is not None else 1}
+        df_amz["_date"] = pd.to_datetime(_dparts, errors="coerce")
+    else:
+        df_amz["_date"] = pd.NaT
+
+# 6) Limpeza básica -------------------------------------------
+df_amz = df_amz[df_amz["_chl"].notna()].copy()
+if df_amz.empty:
+    raise RuntimeError("Após conversão para numérico, não restaram valores de clorofila válidos na Amazônia.")
+
+# 7) LOOP por corpo d’água ------------------------------------
+summary_all = []
+by_year_all = []
+
+sites = sorted({_norm(n) for n in df_amz[name_col].dropna().unique().tolist()})
+print(f"[INFO] Corpos d'água na Amazônia (n={len(sites)}): gerando saídas por site…")
+
+for site in sites:
+    sub = df_amz[df_amz[name_col].map(lambda x: _norm(x) == site)].copy()
+    if sub.empty:
+        continue
+
+    pretty_name = sub[name_col].dropna().iloc[0]
+    site_slug   = _slug(pretty_name)
+    OUTDIR = OUT_ROOT / f"{site_slug}"
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+
+    # Outliers
+    sub["_chl_raw"] = sub["_chl"].copy()
+    if REMOVE_OUTLIERS and len(sub) > 10:
+        kept = _remove_outliers_iqr(sub["_chl"])
+        sub = sub[sub["_chl"].isin(kept)].copy()
+
+    # -------------- Fig 1: apenas valores
+    fig1, ax1 = plt.subplots(figsize=(8,5))
+    ax1.plot(sub["_chl"].values, marker="o", linestyle="", alpha=0.7)
+    ax1.set_xlabel("Observações")
+    _apply_common(ax1, f"{pretty_name} — Clorofila-a (apenas valores)",
+                  ylabel=chla_col, logy=LOG_SCALE_Y)
+    _savefig(fig1, OUTDIR / "01_values.png")
+
+    # Datas?
+    has_dates = sub["_date"].notna().any()
+
+    # -------------- Fig 2: série temporal
+    if has_dates:
+        dft = sub.sort_values("_date")
+        fig2, ax2 = plt.subplots(figsize=(10,5))
+        ax2.plot(dft["_date"], dft["_chl"], marker="o", linestyle="", alpha=0.7)
+        ax2.set_xlabel("Data")
+        _apply_common(ax2, f"{pretty_name} — Clorofila-a (série temporal)",
+                      ylabel=chla_col, logy=LOG_SCALE_Y)
+        fig2.autofmt_xdate()
+        _savefig(fig2, OUTDIR / "02_timeseries.png")
+    else:
+        print(f"[INFO] {pretty_name}: sem datas válidas para série temporal.")
+
+    # -------------- Fig 3A/3B + Fig 4 + Fig 6 (dependem de data)
+    if has_dates:
+        sub["year"] = sub["_date"].dt.year
+
+        # 3A — por ano (cores)
+        fig3a, ax3a = plt.subplots(figsize=(10,6))
+        for y, g in sub.groupby("year"):
+            if pd.isna(y): continue
+            ax3a.scatter(g["_date"], g["_chl"], alpha=0.75, label=str(int(y)))
+        ax3a.set_xlabel("Data")
+        _apply_common(ax3a, f"{pretty_name} — série temporal (por ano)",
+                      ylabel=chla_col, logy=LOG_SCALE_Y)
+        ax3a.legend(title="Ano", ncol=2, fontsize=9)
+        fig3a.autofmt_xdate()
+        _savefig(fig3a, OUTDIR / "03A_timescatter_by_year.png")
+
+        # 3B — X categórico (ano)
+        years = sorted(int(y) for y in sub["year"].dropna().unique())
+        pos = {y:i for i,y in enumerate(years)}
+        fig3b, ax3b = plt.subplots(figsize=(10,6))
+        for y in years:
+            gg = sub[sub["year"]==y]
+            x = pos[y] + (np.random.rand(len(gg)) - 0.5)*0.3
+            ax3b.scatter(x, gg["_chl"], alpha=0.7, label=str(y))
+        ax3b.set_xticks(list(pos.values()))
+        ax3b.set_xticklabels([str(y) for y in years])
+        ax3b.set_xlabel("Ano")
+        _apply_common(ax3b, f"{pretty_name} — dispersão por ano",
+                      ylabel=chla_col, logy=LOG_SCALE_Y)
+        ax3b.legend(title="Ano", ncol=2, fontsize=9)
+        _savefig(fig3b, OUTDIR / "03B_scatter_year_categ.png")
+
+        # 4 — Boxplot por ano
+        order = sorted([int(y) for y in sub["year"].dropna().unique()])
+        data_by_year = [sub.loc[sub["year"]==y, "_chl"].values for y in order]
+        fig4, ax4 = plt.subplots(figsize=(10,6))
+        ax4.boxplot(data_by_year, labels=[str(y) for y in order], showfliers=not REMOVE_OUTLIERS)
+        ax4.set_xlabel("Ano da campanha")
+        _apply_common(ax4, f"{pretty_name} — boxplot por ano",
+                      ylabel=chla_col, logy=LOG_SCALE_Y)
+        _savefig(fig4, OUTDIR / "04_box_by_year.png")
+
+    # -------------- Fig 5: Histograma
+    vals = sub["_chl"].dropna()
+    fig5, ax5 = plt.subplots(figsize=(8,5))
+    if HIST_LOGX:
+        v = vals[vals > 0]
+        ax5.hist(v, bins=30); ax5.set_xscale("log")
+    else:
+        ax5.hist(vals, bins=30)
+    _apply_common(ax5, f"{pretty_name} — Histograma de Clorofila-a", ylabel="Frequência", logy=False)
+    ax5.set_xlabel(chla_col)
+    _savefig(fig5, OUTDIR / "05_hist.png")
+
+    # -------------- Fig 6: Violino por ano
+    if has_dates and sub["_date"].notna().any():
+        if "year" not in sub.columns: sub["year"] = sub["_date"].dt.year
+        years = sorted(int(y) for y in sub["year"].dropna().unique())
+        data_by_year = [sub.loc[sub["year"] == y, "_chl"].dropna().values for y in years]
+        years_f, data_f = [], []
+        for y, v in zip(years, data_by_year):
+            v = v[np.isfinite(v)]
+            if v.size >= 2:
+                years_f.append(y); data_f.append(v)
+        if len(data_f) > 0:
+            fig6, ax6 = plt.subplots(figsize=(12,6))
+            parts = ax6.violinplot(data_f, positions=np.arange(len(years_f)),
+                                   widths=0.8, showmeans=False, showmedians=False, showextrema=False)
+            cmap = plt.cm.viridis
+            for i, b in enumerate(parts['bodies']):
+                b.set_facecolor(cmap(i/max(1,len(years_f)-1))); b.set_edgecolor("black"); b.set_linewidth(0.6); b.set_alpha(0.9)
+            bp = ax6.boxplot(data_f, positions=np.arange(len(years_f)), widths=0.15,
+                             vert=True, showfliers=not REMOVE_OUTLIERS, patch_artist=True)
+            for box in bp['boxes']:
+                box.set_facecolor("white"); box.set_alpha(0.9); box.set_edgecolor("black")
+            for med in bp['medians']: med.set_linewidth(1.5)
+            ax6.set_xticks(np.arange(len(years_f))); ax6.set_xticklabels([str(y) for y in years_f])
+            if LOG_SCALE_Y: ax6.set_yscale("log")
+            ax6.set_ylabel(chla_col); ax6.set_title(f"{pretty_name} — Violino por ano")
+            ax6.grid(True, which="both", axis="y", alpha=0.25)
+            _savefig(fig6, OUTDIR / "06_violin_by_year.png")
+
+    # -------------- Estatísticas e CSV/Excel por site
+    overall_stats = _desc_stats(sub["_chl"]).to_frame(name="overall").T.round(3)
+    overall_stats.to_csv(OUTDIR / "stats_overall.csv")
+    if has_dates and sub["_date"].notna().any():
+        if "year" not in sub.columns: sub["year"] = sub["_date"].dt.year
+        by_year_stats = sub.groupby("year")["_chl"].apply(_desc_stats).unstack().round(3)
+        by_year_stats.to_csv(OUTDIR / "stats_by_year.csv")
+        by_year_all.append(by_year_stats.assign(site=pretty_name).reset_index())
+    summary_all.append(overall_stats.assign(site=pretty_name))
+
+# 8) Consolidados (Amazon-wide) ---------------------------------
+if summary_all:
+    df_sum_all = pd.concat(summary_all, ignore_index=True)
+    df_sum_all.to_csv(OUT_ROOT / "AMAZON_summary_overall_by_site.csv", index=False)
+if by_year_all:
+    df_by_year_all = pd.concat(by_year_all, ignore_index=True)
+    df_by_year_all.rename(columns={"index":"year"}, inplace=True)
+    df_by_year_all.to_csv(OUT_ROOT / "AMAZON_stats_by_year_by_site.csv", index=False)
+
+print("\n[OK] Finalizado.")
+print("Saídas em:", OUT_ROOT)
