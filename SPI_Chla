@@ -1,0 +1,485 @@
+# ============================================================
+# SPI × Chl-a (MODIS) por UNIDADE — Amazônia
+# - Entrada: CHIRPS mensal por unidade (CSV) OU exporta via EE
+# - Entrada: GeoTIFFs mensais MODIS (sinusoidal) do seu pipeline
+# - Saídas: CSVs (SPI, Chl-a por unidade, merges, correlações, efeitos de seca)
+#           + figuras rápidas
+# ============================================================
+
+# ================== CONFIG ==================
+# 0) Pastas (Drive)
+import os
+from pathlib import Path
+DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts")).resolve()
+OUT_DIR    = DRIVE_ROOT / "spi_links"; OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 1) CHIRPS (escolha UMA das rotas)
+#    ROTA A (recomendada): já ter um CSV "precip_monthly_by_unit.csv" no Drive
+PRECIP_TABLE_CSV = Path(os.environ.get("PRECIP_TABLE_CSV",
+                          f"{DRIVE_ROOT}/inputs/precip_monthly_by_unit.csv")).resolve()
+
+#    ROTA B (opcional): Exportar via Earth Engine (preencher e setar RUN_EE_EXPORT=True)
+RUN_EE_EXPORT = False
+EE_UNITS_ASSET = "users/<seu_usuario>/Hydro_lakes_AM_basin"   # <- ajuste se for exportar
+EE_ID_FIELD    = "unit_id"                                     # <- campo com ID
+EE_START = "2001-01-01"; EE_END = "2024-12-31"                 # coerente c/ MODIS
+EE_DRIVE_FOLDER = "amazonia_inputs"                            # onde cai o CSV no Drive
+
+# 2) Unidades espaciais
+#    Se você já tem **MÁSCARA raster** com IDs (mesma grade/CRS dos seus GeoTIFFs), aponte aqui.
+#    Caso contrário, informe o shape: rasterizamos alinhado a cada GeoTIFF.
+UNITS_MASK_TIF = None  # ex.: DRIVE_ROOT/"inputs/units_id_mask_sinusoidal.tif"
+UNITS_SHP      = Path(os.environ.get("UNITS_SHP",
+                         f"{DRIVE_ROOT}/inputs/shapes/Hydro_lakes_AM_basin.shp")).resolve()
+UNITS_ID_FIELD = "unit_id"  # campo do shapefile com o identificador
+
+# 3) GeoTIFFs de Chl-a (do seu pipeline)
+#    Procuramos recursivamente por "amazonia_chla_YYYY-MM*.tif" dentro de DRIVE_ROOT
+TIF_GLOB = "amazonia_chla_????-??*.tif"
+NODATA_CHLA = -9999.0
+
+# 4) SPI
+SPI_SCALES = [1, 3, 6]    # meses
+SPI_EPS    = 1e-6         # evita zeros ao ajustar gamma
+# Lags (defasagens, em meses) aplicados SPI(t - lag) ~ Chl-a(t)
+LAGS = [0, 1, 2, 3]
+
+# 5) Seca/chuva (limiares)
+SPI_DROUGHT = -1.0     # seca moderada (mude p/ -1.5 p/ severa)
+SPI_WET     =  1.0
+
+# 6) Plots rápidos
+MAKE_PLOTS = True
+DPI = 170
+
+# ================== DEPENDÊNCIAS ==================
+import warnings, re, glob, math
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# geoespacial
+import rasterio as rio
+from rasterio.features import rasterize
+from rasterio.warp import transform_geom
+from rasterio.plot import plotting_extent
+import geopandas as gpd
+import fiona
+
+# estatística
+try:
+    import scipy
+    from scipy.stats import gamma, norm, spearmanr, kendalltau, pearsonr, mannwhitneyu
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "scipy"])
+    from scipy.stats import gamma, norm, spearmanr, kendalltau, pearsonr, mannwhitneyu
+
+# datas
+from dateutil.relativedelta import relativedelta
+
+
+# ================== (Opcional) Exporta CHIRPS via EE ==================
+def export_chirps_monthly_by_unit_ee(enable=False):
+    if not enable:
+        return
+    try:
+        import ee
+        ee.Initialize()
+    except Exception:
+        import ee
+        ee.Authenticate(auth_mode='notebook')
+        ee.Initialize()
+    CHIRPS = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+    units = ee.FeatureCollection(EE_UNITS_ASSET)
+
+    def monthly_ic(start, end):
+        s, e = ee.Date(start), ee.Date(end)
+        n = e.difference(s, "month").toInt()
+        months = ee.List.sequence(0, n.subtract(1))
+        def per_m(m):
+            d0 = s.advance(m, 'month')
+            d1 = d0.advance(1, 'month')
+            img = CHIRPS.filterDate(d0, d1).sum().rename("precip_mm")
+            return img.set({"date": d0.format("YYYY-MM-01")})
+        return ee.ImageCollection.fromImages(months.map(per_m))
+
+    ic = monthly_ic(EE_START, EE_END)
+
+    def zonal(image):
+        stats = image.reduceRegions(
+            collection=units,
+            reducer=ee.Reducer.mean(),
+            scale=5000
+        ).map(lambda f: f.set({"date": image.get("date")}))
+        return stats
+
+    table = ic.map(zonal).flatten().select([EE_ID_FIELD, "date", "mean"],
+                                           ["unit_id","date","precip_mm"])
+
+    task = ee.batch.Export.table.toDrive(
+        collection   = table,
+        description  = "precip_monthly_by_unit_chirps",
+        folder       = EE_DRIVE_FOLDER,
+        fileNamePrefix = "precip_monthly_by_unit",
+        fileFormat   = "CSV"
+    )
+    task.start()
+    print("[EE] Export iniciado → Drive/"
+          f"{EE_DRIVE_FOLDER}/precip_monthly_by_unit.csv")
+
+
+# ================== SPI (Gamma + Normal) ==================
+def _spi_single_scale(df_u: pd.DataFrame, scale: int) -> pd.Series:
+    """
+    df_u: DataFrame com colunas ['date','precip_mm'] por unidade (mensal contínuo)
+    scale: janela em meses (rolling sum)
+    Retorna: pd.Series SPI_scale indexado por 'date'
+    """
+    s = df_u.set_index("date")["precip_mm"].astype(float).copy()
+    # soma acumulada na janela
+    agg = s.rolling(scale, min_periods=max(3, scale//2)).sum()
+    months = agg.index.month
+
+    spi = pd.Series(index=agg.index, dtype="float64")
+    for m in range(1, 13):
+        idx = (months == m)
+        x = agg[idx].dropna().values
+        if x.size < 8:
+            # fallback: usa todos os meses
+            x_all = agg.dropna().values
+            if x_all.size < 8:
+                spi[idx] = np.nan
+                continue
+            try:
+                a, loc, sc = gamma.fit(x_all + SPI_EPS, floc=0)
+                cdf_all = gamma.cdf(agg[idx].values + SPI_EPS, a=a, loc=0, scale=sc)
+                spi[idx] = norm.ppf(np.clip(cdf_all, 1e-6, 1-1e-6))
+            except Exception:
+                mu, sd = np.nanmean(x_all), np.nanstd(x_all, ddof=1)
+                spi[idx] = (agg[idx] - mu) / (sd + 1e-12)
+            continue
+
+        try:
+            a, loc, sc = gamma.fit(x + SPI_EPS, floc=0)
+            cdf = gamma.cdf(agg[idx].values + SPI_EPS, a=a, loc=0, scale=sc)
+            spi[idx] = norm.ppf(np.clip(cdf, 1e-6, 1-1e-6))
+        except Exception:
+            mu, sd = np.nanmean(x), np.nanstd(x, ddof=1)
+            spi[idx] = (agg[idx] - mu) / (sd + 1e-12)
+    return spi
+
+
+def compute_spi(df_precip: pd.DataFrame, scales=SPI_SCALES) -> pd.DataFrame:
+    """
+    df_precip: colunas ['unit_id','date','precip_mm'] (mensal por unidade, contínuo)
+    Retorna long-form com SPI por escala.
+    """
+    df_precip = df_precip.copy()
+    df_precip["date"] = pd.to_datetime(df_precip["date"])
+    out = []
+    for uid, g in df_precip.groupby("unit_id"):
+        g = g.sort_values("date").drop_duplicates("date")
+        # garante frequência MS contínua (preenche meses faltantes com 0 mm)
+        idx = pd.date_range(g["date"].min(), g["date"].max(), freq="MS")
+        gg = g.set_index("date").reindex(idx).fillna({"precip_mm": 0.0})
+        gg = gg.reset_index().rename(columns={"index": "date"})
+        row = {"unit_id": uid, "date": gg["date"]}
+        for k in scales:
+            row[f"SPI{k}"] = _spi_single_scale(gg[["date","precip_mm"]], k).values
+        df_u = pd.DataFrame(row)
+        out.append(df_u)
+    return pd.concat(out, ignore_index=True)
+
+
+# ================== CHL-a por unidade (dos GeoTIFFs) ==================
+def _list_chla_tifs(root: Path, pat=TIF_GLOB):
+    pats = list(root.rglob(pat))
+    # remove duplicatas "LATEST_" se houver um definitivo no mesmo mês
+    keep = {}
+    for p in pats:
+        name = p.name
+        m = re.search(r"(\d{4})-(\d{2})", name)
+        if not m: 
+            continue
+        key = (m.group(1), m.group(2))
+        # preferir o definitivo (sem "LATEST_")
+        if key not in keep: keep[key] = p
+        else:
+            if name.startswith("LATEST_"):
+                continue
+            if str(keep[key].name).startswith("LATEST_"):
+                keep[key] = p
+    return sorted(keep.values())
+
+
+def _load_units_gdf(shp: Path, id_field: str):
+    with fiona.Env(SHAPE_RESTORE_SHX="YES"):
+        gdf = gpd.read_file(shp)
+    if gdf.crs is None:
+        raise RuntimeError("Shapefile sem CRS — defina corretamente antes de rodar.")
+    if id_field not in gdf.columns:
+        raise RuntimeError(f"Campo '{id_field}' não encontrado no shapefile.")
+    return gdf[[id_field, "geometry"]].copy()
+
+
+def chla_means_by_unit(tif_list, shp_path: Path, id_field: str,
+                       mask_tif: Path = None) -> pd.DataFrame:
+    """
+    Para cada GeoTIFF mensal, calcula a média por unidade (shape→rasterização alinhada).
+    Se mask_tif existir e alinhar perfeitamente ao grid do TIF, usa-o (mais rápido).
+    """
+    gdf = _load_units_gdf(shp_path, id_field)
+    rows = []
+    cache_mask = {}  # cache por (crs_wkt, transform, height, width)
+    for p in tif_list:
+        with rio.open(p) as ds:
+            arr = ds.read(1).astype("float32")
+            nod = ds.nodata if ds.nodata is not None else NODATA_CHLA
+            m_valid = np.isfinite(arr) & (arr != nod)
+            tr = ds.transform
+            crs = ds.crs
+            H, W = ds.height, ds.width
+        # data do nome
+        m = re.search(r"(\d{4})-(\d{2})", p.name)
+        if not m: 
+            continue
+        date = pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+
+        # máscara de unidades
+        key = (str(crs), tuple(tr) if hasattr(tr, "__iter__") else str(tr), H, W)
+        if key in cache_mask:
+            mask_ids = cache_mask[key]
+        else:
+            if mask_tif and Path(mask_tif).exists():
+                with rio.open(mask_tif) as dm:
+                    # reamostragem se necessário (tenta alinhar pela affine)
+                    if (dm.crs == crs) and (dm.transform == tr) and (dm.width == W) and (dm.height == H):
+                        mask_ids = dm.read(1).astype("int32")
+                    else:
+                        from rasterio.warp import reproject, Resampling
+                        mask_ids = np.zeros((H, W), dtype="int32")
+                        reproject(
+                            source=rio.open(mask_tif).read(1),
+                            destination=mask_ids,
+                            src_transform=rio.open(mask_tif).transform,
+                            src_crs=rio.open(mask_tif).crs,
+                            dst_transform=tr,
+                            dst_crs=crs,
+                            dst_nodata=0,
+                            resampling=Resampling.nearest
+                        )
+            else:
+                # rasteriza shape no grid do TIF
+                geoms_tx = []
+                for geom in gdf.geometry:
+                    geoms_tx.append(transform_geom(gdf.crs.to_string(), crs.to_string(), geom.__geo_interface__, precision=6))
+                shapes = [(g, int(uid)) for g, uid in zip(geoms_tx, gdf[id_field].astype(int).values)]
+                mask_ids = rasterize(shapes, out_shape=(H, W), transform=tr, fill=0, dtype="int32", all_touched=True)
+            cache_mask[key] = mask_ids
+
+        # médias por unidade
+        for uid in np.unique(mask_ids):
+            if uid == 0: 
+                continue
+            m = (mask_ids == uid) & m_valid
+            if m.any():
+                rows.append({"unit_id": int(uid), "date": date, "chla_mgm3": float(arr[m].mean())})
+    if not rows:
+        raise RuntimeError("Não consegui extrair médias por unidade — verifique shapes/máscara e TIFs.")
+    df = pd.DataFrame(rows).sort_values(["unit_id","date"]).reset_index(drop=True)
+    return df
+
+
+# ================== Associação SPI × Chl-a ==================
+def align_with_lag(df_chla: pd.DataFrame, df_spi: pd.DataFrame, lags=LAGS, scales=SPI_SCALES):
+    """
+    Retorna long-form com colunas:
+      unit_id, date, chla_mgm3, scale, lag, SPI, ...
+    """
+    df_chla = df_chla.copy()
+    df_chla["date"] = pd.to_datetime(df_chla["date"])
+
+    out = []
+    for k in scales:
+        spi_k = df_spi[["unit_id","date", f"SPI{k}"]].rename(columns={f"SPI{k}": "SPI"})
+        for L in lags:
+            tmp = df_chla.copy()
+            tmp["date_spi"] = tmp["date"] - pd.to_timedelta(L, unit="MS")
+            m = tmp.merge(spi_k.rename(columns={"date":"date_spi"}), on=["unit_id","date_spi"], how="left")
+            m["scale"] = k; m["lag"] = L
+            m = m.rename(columns={"date": "date"})[["unit_id","date","chla_mgm3","scale","lag","SPI"]]
+            out.append(m)
+    return pd.concat(out, ignore_index=True)
+
+
+def correlations_by_unit(df_aligned: pd.DataFrame):
+    rows = []
+    for (uid, scale, lag), g in df_aligned.dropna(subset=["SPI","chla_mgm3"]).groupby(["unit_id","scale","lag"]):
+        x = g["SPI"].values
+        y = g["chla_mgm3"].values
+        if len(x) >= 6:
+            r_s, p_s = spearmanr(x, y)
+            r_k, p_k = kendalltau(x, y)
+            r_p, p_p = pearsonr(x, y)
+        else:
+            r_s = r_k = r_p = np.nan; p_s = p_k = p_p = np.nan
+        rows.append({
+            "unit_id": uid, "scale": scale, "lag": lag, "n": int(len(x)),
+            "rho_spearman": float(r_s), "p_spearman": float(p_s) if np.isfinite(p_s) else np.nan,
+            "tau_kendall": float(r_k),  "p_kendall":  float(p_k) if np.isfinite(p_k) else np.nan,
+            "r_pearson": float(r_p),    "p_pearson":  float(p_p) if np.isfinite(p_p) else np.nan
+        })
+    dfc = pd.DataFrame(rows)
+    # melhor (por |rho_spearman|) por unidade
+    best = (dfc.assign(abs_r=lambda d: d["rho_spearman"].abs())
+              .sort_values(["unit_id","abs_r"], ascending=[True, False])
+              .drop_duplicates("unit_id"))
+    return dfc, best[["unit_id","scale","lag","rho_spearman","p_spearman","n"]].reset_index(drop=True)
+
+
+def drought_effects(df_aligned: pd.DataFrame, drought_thr=SPI_DROUGHT, pick="best"):
+    """
+    Compara Chl-a em meses de seca (SPI<=thr) vs não-seca, por unidade.
+    pick="best" = usa (scale,lag) com maior |rho_spearman|; senão, usa (scale=min, lag=0)
+    """
+    dfc, best = correlations_by_unit(df_aligned)
+    if pick != "best":
+        # escolhe primeiro scale/lag disponível por unidade
+        first = (df_aligned.dropna(subset=["SPI"])
+                 .sort_values(["unit_id","scale","lag"])
+                 .drop_duplicates(["unit_id"])[["unit_id","scale","lag"]])
+        best = first
+
+    rows = []
+    for _, row in best.iterrows():
+        uid = int(row["unit_id"])
+        sc  = int(row["scale"])
+        lg  = int(row["lag"])
+        g = df_aligned[(df_aligned["unit_id"]==uid) & (df_aligned["scale"]==sc) & (df_aligned["lag"]==lg)]
+        g = g.dropna(subset=["SPI","chla_mgm3"])
+        if len(g) < 6:
+            rows.append({"unit_id": uid, "scale": sc, "lag": lg, "n": int(len(g)),
+                         "chla_mean_drought": np.nan, "chla_mean_nondrought": np.nan,
+                         "delta": np.nan, "ratio": np.nan, "p_mw": np.nan})
+            continue
+        m_d = g[g["SPI"] <= drought_thr]["chla_mgm3"].values
+        m_n = g[g["SPI"] >  drought_thr]["chla_mgm3"].values
+        if (m_d.size < 2) or (m_n.size < 2):
+            rows.append({"unit_id": uid, "scale": sc, "lag": lg, "n": int(len(g)),
+                         "chla_mean_drought": float(np.nanmean(m_d)) if m_d.size else np.nan,
+                         "chla_mean_nondrought": float(np.nanmean(m_n)) if m_n.size else np.nan,
+                         "delta": np.nan, "ratio": np.nan, "p_mw": np.nan})
+            continue
+        stat, p = mannwhitneyu(m_d, m_n, alternative="two-sided")
+        rows.append({
+            "unit_id": uid, "scale": sc, "lag": lg, "n": int(len(g)),
+            "chla_mean_drought": float(np.mean(m_d)),
+            "chla_mean_nondrought": float(np.mean(m_n)),
+            "delta": float(np.mean(m_d) - np.mean(m_n)),
+            "ratio": float(np.mean(m_d) / (np.mean(m_n)+1e-12)),
+            "p_mw": float(p)
+        })
+    dfe = pd.DataFrame(rows)
+    # junta melhor correlação, se existir
+    try:
+        _, best_corr = correlations_by_unit(df_aligned)
+        dfe = dfe.merge(best_corr, on=["unit_id","scale","lag"], how="left")
+    except Exception:
+        pass
+    return dfe
+
+
+# ================== PIPELINE ==================
+def main():
+    print(f"[ROOT] {DRIVE_ROOT}")
+    # (Opcional) exporta CHIRPS via EE
+    export_chirps_monthly_by_unit_ee(RUN_EE_EXPORT)
+
+    # 1) Carrega CHIRPS mensal por unidade
+    if not PRECIP_TABLE_CSV.exists():
+        raise FileNotFoundError(f"CSV de precipitação não encontrado: {PRECIP_TABLE_CSV}\n"
+                                f"Exporte pelo EE (RUN_EE_EXPORT=True) e faça o download no Drive.")
+    dfp = pd.read_csv(PRECIP_TABLE_CSV)
+    dfp = dfp.rename(columns={c: c.lower() for c in dfp.columns})
+    assert {"unit_id","date","precip_mm"}.issubset(dfp.columns), "CSV deve ter unit_id,date,precip_mm"
+    dfp["date"] = pd.to_datetime(dfp["date"])
+    print(f"[CHIRPS] Linhas: {len(dfp)} | unidades: {dfp['unit_id'].nunique()} | "
+          f"período: {dfp['date'].min().date()} → {dfp['date'].max().date()}")
+
+    # 2) SPI
+    spi = compute_spi(dfp[["unit_id","date","precip_mm"]], scales=SPI_SCALES)
+    spi.to_csv(OUT_DIR/"spi_by_unit.csv", index=False)
+    print("[OK] SPI salvo:", OUT_DIR/"spi_by_unit.csv")
+
+    # 3) Chl-a por unidade (dos seus GeoTIFFs)
+    tifs = _list_chla_tifs(DRIVE_ROOT)
+    if not tifs:
+        raise RuntimeError(f"Nenhum TIF encontrado em {DRIVE_ROOT} com padrão {TIF_GLOB}")
+    print(f"[MODIS] GeoTIFFs mensais encontrados: {len(tifs)} (primeiros 3)\n  - " +
+          "\n  - ".join(str(p) for p in tifs[:3]))
+    df_chla = chla_means_by_unit(tifs, UNITS_SHP, UNITS_ID_FIELD, UNITS_MASK_TIF)
+    df_chla.to_csv(OUT_DIR/"chla_monthly_by_unit.csv", index=False)
+    print("[OK] Chl-a por unidade salvo:", OUT_DIR/"chla_monthly_by_unit.csv")
+
+    # 4) Alinhamento (lags) e correlações
+    aligned = align_with_lag(df_chla, spi, lags=LAGS, scales=SPI_SCALES)
+    aligned.to_csv(OUT_DIR/"spi_chla_aligned_long.csv", index=False)
+    print("[OK] Merge alinhado salvo:", OUT_DIR/"spi_chla_aligned_long.csv")
+
+    corr_all, corr_best = correlations_by_unit(aligned)
+    corr_all.to_csv(OUT_DIR/"correlations_by_unit_all.csv", index=False)
+    corr_best.to_csv(OUT_DIR/"correlations_by_unit_best.csv", index=False)
+    print("[OK] Correlações salvas:",
+          OUT_DIR/"correlations_by_unit_all.csv",
+          OUT_DIR/"correlations_by_unit_best.csv")
+
+    # 5) Efeitos de seca (when/where)
+    dfe = drought_effects(aligned, drought_thr=SPI_DROUGHT, pick="best")
+    dfe.to_csv(OUT_DIR/"drought_effects_by_unit.csv", index=False)
+    print("[OK] Efeitos de seca salvos:", OUT_DIR/"drought_effects_by_unit.csv")
+
+    # 6) Plots rápidos (agregados)
+    if MAKE_PLOTS:
+        # Heatmap (lag × scale) da mediana(|rho|) entre unidades
+        piv = (corr_all.assign(absrho=lambda d: d["rho_spearman"].abs())
+                        .groupby(["scale","lag"])["absrho"].median().unstack())
+        plt.figure(figsize=(6,4))
+        im = plt.imshow(piv.values, aspect="auto", interpolation="nearest")
+        plt.xticks(range(piv.shape[1]), piv.columns)
+        plt.yticks(range(piv.shape[0]), piv.index)
+        plt.colorbar(im, label="Median |Spearman ρ| across units")
+        plt.xlabel("Lag (months)"); plt.ylabel("SPI scale (months)")
+        plt.title("SPI–Chl-a association strength (median |ρ|)")
+        plt.tight_layout(); plt.savefig(OUT_DIR/"heatmap_median_absrho.png", dpi=DPI); plt.close()
+
+        # Distribuição das melhores correlações por unidade
+        vals = corr_best["rho_spearman"].dropna().values
+        if vals.size:
+            plt.figure(figsize=(6,4))
+            plt.hist(vals, bins=25, edgecolor="k", alpha=0.8)
+            plt.xlabel("Best Spearman ρ per unit"); plt.ylabel("Frequency")
+            plt.title("Distribution of best SPI–Chl-a correlations")
+            plt.tight_layout(); plt.savefig(OUT_DIR/"hist_best_rho.png", dpi=DPI); plt.close()
+
+        # Efeito de seca (razão) por unidade
+        if "ratio" in dfe.columns:
+            v = dfe["ratio"].replace([np.inf,-np.inf], np.nan).dropna().values
+            if v.size:
+                plt.figure(figsize=(6,4))
+                plt.hist(v, bins=25, edgecolor="k", alpha=0.8)
+                plt.xlabel("Chl-a drought/non-drought ratio"); plt.ylabel("Frequency")
+                plt.title("Where drought elevates Chl-a (ratio>1)")
+                plt.tight_layout(); plt.savefig(OUT_DIR/"hist_drought_ratio.png", dpi=DPI); plt.close()
+
+    print("\n[OK] Concluído. Artefatos em:", OUT_DIR)
+    for p in sorted(OUT_DIR.glob("*.csv")): print(" -", p.name)
+    for p in sorted(OUT_DIR.glob("*.png")): print(" -", p.name)
+
+
+if __name__ == "__main__":
+    main()
