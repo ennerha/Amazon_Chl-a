@@ -1,0 +1,262 @@
+# ============================================================
+# Rrs (Amazônia Legal, por site) + simulação MODIS (Aqua/Terra via RSR)
+# - Lê de DRIVE_ROOT/inputs: rrs.xlsx, aqua_modis_RSR.nc, terra_modis_RSR.nc
+# - Processa TODAS as estações na Amazônia Legal (ou 1 site se STATION_KEY set)
+# - Saídas por site: curvas médias ±1σ (campo e bandas) e CSV com Rrs simulada
+# - Salva em DRIVE_ROOT/figures/rrs_modis/<site_slug>/
+# Requisitos: pandas, numpy, matplotlib, xarray
+# ============================================================
+
+# ================== CONFIG ==================
+import os, re, unicodedata
+from pathlib import Path
+
+# Drive / pastas
+DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts"))
+INPUTS_DIR = DRIVE_ROOT / "inputs"
+OUT_BASE   = DRIVE_ROOT / "figures" / "rrs_modis"
+OUT_BASE.mkdir(parents=True, exist_ok=True)
+
+# Arquivos de entrada em inputs/
+F_RRS   = INPUTS_DIR / "rrs.xlsx"
+F_AQUA  = INPUTS_DIR / "aqua_modis_RSR.nc"
+F_TERRA = INPUTS_DIR / "terra_modis_RSR.nc"
+
+# Filtro de site (opcional): None => processa todos os sites
+STATION_KEY = None   # ex.: "curuai" para filtrar só Curuai
+FIG_DPI     = 300
+
+# UFs da Amazônia Legal (se houver coluna 'state' em rrs.xlsx)
+AMAZON_STATES = {"AC","AM","AP","PA","RO","RR","TO","MA","MT"}
+
+# ================ IMPORTS ===================
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ================ Checagens ==================
+for p in [F_RRS, F_AQUA, F_TERRA]:
+    if not Path(p).exists():
+        raise FileNotFoundError(f"Entrada necessária não encontrada: {p}")
+
+print("[INFO] RRS:", F_RRS)
+print("[INFO] AQUA RSR:", F_AQUA)
+print("[INFO] TERRA RSR:", F_TERRA)
+print("[OK]  OUT_BASE:", OUT_BASE.resolve())
+
+# ============== Leitura Rrs (todas as abas) ==========
+xls = pd.ExcelFile(F_RRS)
+frames = []
+for sh in xls.sheet_names:
+    try:
+        df_sh = pd.read_excel(F_RRS, sheet_name=sh)
+        df_sh["__sheet__"] = sh
+        frames.append(df_sh)
+    except Exception as e:
+        print(f"[WARN] Falha ao ler aba '{sh}': {e}")
+if not frames:
+    raise RuntimeError("Nenhuma planilha válida em rrs.xlsx.")
+df = pd.concat(frames, ignore_index=True)
+df.columns = [str(c).strip() for c in df.columns]
+
+# Filtra Amazônia Legal se houver 'state'
+if "state" in df.columns:
+    df["state"] = df["state"].astype(str).str.upper().str.strip()
+    before = len(df)
+    df = df[df["state"].isin(AMAZON_STATES)].copy()
+    print(f"[INFO] Filtro Amazônia Legal por 'state': {before} -> {len(df)} linhas")
+if len(df) == 0:
+    raise RuntimeError("Sem linhas após filtro Amazônia Legal (ou planilha vazia).")
+
+# Column helpers
+def _norm(s: str) -> str:
+    s = str(s or "")
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    return s.strip()
+def _slug(s: str) -> str:
+    s = _norm(s).lower()
+    s = re.sub(r"[^a-z0-9]+","-",s)
+    return s.strip("-") or "sem-nome"
+
+# Descobre coluna(s) de identificação do site
+site_cols = [c for c in df.columns if any(k in c.lower() for k in
+             ["lake_name","site","station","local","name","lago","lagoon","ponto","estacao","estação","system"])]
+if site_cols:
+    site_id_col = site_cols[0]
+else:
+    # cria um identificador genérico
+    site_id_col = "__site__"
+    df[site_id_col] = "Unknown"
+
+# Aplica filtro STATION_KEY (opcional)
+if STATION_KEY:
+    mask = df[site_id_col].astype(str).str.lower().str.contains(STATION_KEY.lower(), na=False)
+    if not mask.any():
+        print(f"[WARN] Nenhuma linha combinou com STATION_KEY='{STATION_KEY}'. Processando tudo.")
+    else:
+        df = df[mask].copy()
+        print(f"[OK] Filtrado por STATION_KEY='{STATION_KEY}': {len(df)} linhas")
+
+# Detectar colunas Rrs_###
+w_cols, w_nm = [], []
+for c in df.columns:
+    s = str(c)
+    s_low = s.lower()
+    if "rrs" in s_low:
+        m = re.findall(r"(\d{3,4})", s_low)
+        if m:
+            nm = int(m[-1])
+            if 350 <= nm <= 900:
+                w_cols.append(c); w_nm.append(nm)
+if not w_cols:
+    raise RuntimeError("Nenhuma coluna de espectro encontrada (ex.: 'Rrs_400'…'Rrs_900').")
+order = np.argsort(w_nm)
+w_cols = [w_cols[i] for i in order]
+w_nm   = np.array([w_nm[i] for i in order], dtype=float)
+
+# ============== Funções de plot/simulação ==============
+def plot_rrs_field(wavelengths, R_stack, outdir, title_prefix="Rrs — campo"):
+    grid = np.arange(wavelengths.min(), wavelengths.max() + 1, 1.0)
+    R_grid = np.array([np.interp(grid, wavelengths, r, left=np.nan, right=np.nan) for r in R_stack])
+    mu = np.nanmean(R_grid, axis=0)
+    sd = np.nanstd(R_grid, axis=0)
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(grid, mu, linewidth=2)
+    ax.fill_between(grid, mu - sd, mu + sd, alpha=0.25)
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_ylabel("in situ Rrs (sr$^{-1}$)")
+    ax.set_title(f"{title_prefix} (média ± 1σ)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    p = outdir / "01_rrs_field_mean_sd.png"
+    plt.tight_layout(); plt.savefig(p, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+    print("[OK] Figura (campo):", p)
+
+def load_rsr_dict(nc_path, sensor_label):
+    ds = xr.open_dataset(nc_path)
+    wl = ds["wavelength"].values.astype(float)   # nm
+    RSR = ds["RSR"].values.astype(float)        # (bands, wavelengths)
+    # ordem crescente
+    if not np.all(np.diff(wl) >= 0):
+        ord_w = np.argsort(wl); wl = wl[ord_w]; RSR = RSR[:, ord_w]
+    bands = {}; centers = []
+    for i in range(RSR.shape[0]):
+        r = RSR[i]
+        good = np.isfinite(wl) & np.isfinite(r) & (r > 0)
+        if not good.any(): continue
+        num = np.trapz(wl[good]*r[good], wl[good]); den = np.trapz(r[good], wl[good])
+        c = num/den if den > 0 else np.nan
+        if not np.isfinite(c): continue
+        centers.append(c)
+        bands[f"{sensor_label}_B{int(round(c))}"] = (wl[good], r[good])
+    return bands, np.array(centers, float)
+
+def integrate_band(rrs_w_nm, rrs_vals, srf_w, srf_r):
+    r_i = np.interp(srf_w, rrs_w_nm, rrs_vals, left=np.nan, right=np.nan)
+    good = np.isfinite(r_i) & np.isfinite(srf_r)
+    if not good.any(): return np.nan
+    num = np.trapz(r_i[good] * srf_r[good], srf_w[good])
+    den = np.trapz(srf_r[good], srf_w[good])
+    return float(num / den) if den > 0 else np.nan
+
+def simulate_for_matrix(keys, rsr_dict, rrs_matrix, rrs_w_nm):
+    n_samples = rrs_matrix.shape[0]
+    out = np.full((n_samples, len(keys)), np.nan, float)
+    den_centers = []
+    for j, k in enumerate(keys):
+        sw, sr = rsr_dict[k]
+        den_centers.append(int(round(float(k.split("B")[-1]))))
+        for i in range(n_samples):
+            out[i, j] = integrate_band(rrs_w_nm, rrs_matrix[i], sw, sr)
+    return np.array(den_centers, float), out
+
+def plot_mean_sd_bands(centers, values, title, out_png):
+    mu = np.nanmean(values, axis=0); sd = np.nanstd(values, axis=0)
+    order = np.argsort(centers)
+    centers, mu, sd = centers[order], mu[order], sd[order]
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(centers, mu, linewidth=2, marker="o")
+    ax.fill_between(centers, mu - sd, mu + sd, alpha=0.25)
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_ylabel("simulated Rrs (sr$^{-1}$)")
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    plt.tight_layout(); plt.savefig(out_png, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+    print("[OK] Figura:", out_png)
+
+# ============== Carrega RSR (uma vez) ==============
+rsr_aqua,  cent_aqua  = load_rsr_dict(F_AQUA,  "AQUA")
+rsr_terra, cent_terra = load_rsr_dict(F_TERRA, "TERRA")
+
+# ================= Loop por site ====================
+sites = sorted({_norm(s) for s in df[site_id_col].dropna().astype(str).unique().tolist()})
+print(f"[INFO] Sites encontrados (n={len(sites)}).")
+
+for site in sites:
+    sub = df[df[site_id_col].astype(str).map(lambda x: _norm(x) == site)].copy()
+    if sub.empty:
+        continue
+    site_pretty = sub[site_id_col].dropna().astype(str).iloc[0]
+    site_slug = _slug(site_prety) if (site_pretty:=site_pretty) else "site"
+    outdir = OUT_BASE / site_slug
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Matriz de espectros (amostras x λ)
+    R = sub[w_cols].apply(pd.to_numeric, errors="coerce").values
+    valid_rows = np.isfinite(R).sum(axis=1) >= 5
+    R = R[valid_rows]
+    if R.shape[0] == 0:
+        print(f"[WARN] {site_pretty}: sem espectros válidos (>=5 bandas). Pulando.")
+        continue
+
+    print(f"[SITE] {site_pretty}: {R.shape[0]} espectros | λ {w_nm.min():.0f}–{w_nm.max():.0f} nm")
+
+    # 1) Campo — média ±1σ
+    plot_rrs_field(w_nm, R, outdir, title_prefix=f"Rrs — {site_pretty}")
+
+    # 2) Seleciona bandas RSR compatíveis com a faixa do espectro
+    keys_aqua  = [k for k,c in zip(rsr_aqua.keys(),  cent_aqua)  if (c >= w_nm.min()-5) and (c <= w_nm.max()+5)]
+    keys_terra = [k for k,c in zip(rsr_terra.keys(), cent_terra) if (c >= w_nm.min()-5) and (c <= w_nm.max()+5)]
+    print(f"[INFO] {site_pretty}: Bandas Aqua usadas={len(keys_aqua)} | Terra={len(keys_terra)}")
+
+    # 3) Simulação por integração espectral
+    cent_a, A = simulate_for_matrix(keys_aqua,  rsr_aqua,  R, w_nm)
+    cent_t, T = simulate_for_matrix(keys_terra, rsr_terra, R, w_nm)
+
+    # 4) CSV de Rrs simulada
+    df_aqua  = pd.DataFrame(A, columns=keys_aqua)
+    df_terra = pd.DataFrame(T, columns=keys_terra)
+    df_sim = pd.concat([df_aqua, df_terra], axis=1)
+    p_csv = outdir / "rrs_modis_simulated.csv"
+    df_sim.to_csv(p_csv, index=False)
+    print("[OK] CSV Rrs simulada:", p_csv)
+
+    # 5) Figuras por sensor (média ±1σ)
+    plot_mean_sd_bands(cent_a, A, f"{site_pretty} — MODIS Aqua (média ± 1σ)", outdir / "02_rrs_modis_aqua_mean_sd.png")
+    plot_mean_sd_bands(cent_t, T, f"{site_pretty} — MODIS Terra (média ± 1σ)", outdir / "03_rrs_modis_terra_mean_sd.png")
+
+    # 6) Overlay Aqua x Terra
+    mu_a, sd_a = np.nanmean(A, axis=0), np.nanstd(A, axis=0)
+    mu_t, sd_t = np.nanmean(T, axis=0), np.nanstd(T, axis=0)
+    oa, ot = np.argsort(cent_a), np.argsort(cent_t)
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(cent_a[oa], mu_a[oa], linewidth=2, marker="o", label="Aqua")
+    ax.fill_between(cent_a[oa], mu_a[oa]-sd_a[oa], mu_a[oa]+sd_a[oa], alpha=0.18)
+    ax.plot(cent_t[ot], mu_t[ot], linewidth=2, marker="o", label="Terra")
+    ax.fill_between(cent_t[ot], mu_t[ot]-sd_t[ot], mu_t[ot]+sd_t[ot], alpha=0.18)
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_ylabel("simulated Rrs (sr$^{-1}$)")
+    ax.set_title(f"{site_pretty} — MODIS Aqua vs Terra (média ± 1σ)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False)
+    p_overlay = outdir / "04_rrs_modis_overlay.png"
+    plt.tight_layout(); plt.savefig(p_overlay, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+    print("[OK] Figura:", p_overlay)
+
+print("\n[OK] Finalizado. Saídas por site em:", OUT_BASE)
