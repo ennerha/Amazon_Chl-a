@@ -1,0 +1,310 @@
+# ==============================================
+# Estações do ano — plot 2×2 (CLIMATOLOGIA por MÉDIA, viridis, PowerNorm)
+# Integração direta com a saída do pipeline MODIS NATIVO no Google Drive:
+#   DRIVE_ROOT/
+#     └── AAAA/
+#         └── MM/
+#             └── pred/
+#                 ├── amazonia_chla_YYYY-MM__MM.DD.AAAA.tif
+#                 └── LATEST_amazonia_chla_YYYY-MM.tif  (opcional)
+# Também usa ROI do Drive em inputs/shapes/.
+# ==============================================
+
+import os, re, glob, warnings
+from pathlib import Path
+import numpy as np
+import rasterio as rio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
+from matplotlib.colors import PowerNorm
+
+# ====== Dependências extras seguras no Colab ======
+import importlib, sys, subprocess
+def _ensure(pkg, import_name=None):
+    name = import_name or pkg.split('==')[0].split('>=')[0]
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+for pkg, imp in [
+    ("geopandas>=0.12","geopandas"),
+    ("fiona>=1.9","fiona"),
+    ("pyproj>=3.5","pyproj"),
+    ("shapely>=2.0","shapely"),
+    ("pyshp>=2.3","shapefile"),
+]:
+    try:
+        _ensure(pkg, imp)
+    except Exception:
+        pass
+
+import geopandas as gpd
+from shapely.geometry import shape as shp_shape, mapping
+from rasterio.plot import plotting_extent
+from rasterio.warp import transform_geom
+from rasterio.features import rasterize
+
+# ====== Silenciar avisos chatos ======
+warnings.filterwarnings("ignore", message="CPLE_AppDefined")
+warnings.filterwarnings("ignore", category=UserWarning, module="rasterio")
+os.environ.setdefault("SHAPE_RESTORE_SHX", "YES")   # ajuda com .shx ausente
+
+# ===================== Config =====================
+# Raiz usada pelo seu pipeline (mesma variável do seu código de processamento)
+DRIVE_ROOT = Path(os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/amazonia_modis_artifacts"))
+
+# Pasta padrão para figuras
+OUT_DIR = DRIVE_ROOT / "plots_seasonal"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ROI padrão: use um arquivo existente no Drive (pode ser Curuai ou Amazônia)
+# Exemplos comuns no seu fluxo:
+#   DRIVE_ROOT/inputs/shapes/Curuai.shp
+#   DRIVE_ROOT/inputs/shapes/Hydro_lakes_AM_basin.shp
+ROI_PATH = os.environ.get("ROI_PATH", str(DRIVE_ROOT / "inputs" / "shapes" / "Curuai.shp"))
+
+# Se a ROI não tiver PRJ, você pode fixar aqui:
+ROI_CRS_OVERRIDE = None          # ex.: "EPSG:4326" ou "EPSG:4674"
+ALL_TOUCHED = True               # máscara encostando nos limites
+
+# Climatologia sempre por média (empilha todos os anos)
+USE_CLIMATOLOGY = True           # mantido por coerência; este script força a média
+REDUCER = "mean"                 # "mean" ou "median"
+
+# Estações (Hemisfério Sul) — usa meses como proxies climáticos
+SEASONS = [
+    ("(a) Outono — 20 mar", 3),
+    ("(b) Inverno — 20 jun", 6),
+    ("(c) Primavera — 22 set", 9),
+    ("(d) Verão — 21 dez", 12),
+]
+
+# Escala robusta por percentis globais sobre as 4 imagens
+PCTL_LOW, PCTL_HIGH = 2, 98
+
+# Realce perceptual mantendo viridis
+POW_GAMMA = 0.5
+
+# DPI da figura final
+DPI_OUT = 500
+
+# ===================== Utilidades =====================
+def _resolve_roi_path(path_hint: str) -> str:
+    """Aceita .shp/.zip/.gpkg/.geojson e tenta variações se não existir."""
+    p = Path(path_hint)
+    if p.exists():
+        return str(p)
+    for ext in [".zip", ".gpkg", ".geojson", ".json", ".shp"]:
+        cand = p.with_suffix(ext)
+        if cand.exists():
+            return str(cand)
+    # tenta localizar por stem na mesma pasta
+    if p.parent.exists():
+        cands = list(p.parent.glob(p.stem + "*"))
+        for c in cands:
+            if c.suffix.lower() in {".zip",".gpkg",".geojson",".json",".shp"}:
+                return str(c)
+    return str(path_hint)
+
+ROI_PATH = _resolve_roi_path(ROI_PATH)
+print(f"[ROI] Usando: {ROI_PATH}")
+
+# Padrões de nomes gerados pelo pipeline nativo
+#   - preferir LATEST_amazonia_chla_YYYY-MM.tif quando existir
+#   - senão, usar amazonia_chla_YYYY-MM__MM.DD.AAAA.tif
+LATEST_RE = re.compile(r".*/pred/LATEST_amazonia_chla_(\d{4})-(\d{2})\.tif$")
+FINAL_RE  = re.compile(r".*/pred/amazonia_chla_(\d{4})-(\d{2})__\d{2}\.\d{2}\.\d{4}\.tif$")
+
+def find_monthly_files_recursively(drive_root: Path):
+    """Varre DRIVE_ROOT por rasters mensais no padrão do pipeline."""
+    rasters = []
+    # primeiro, pegamos os LATEST (um por mês por ano)
+    for p in drive_root.rglob("pred/LATEST_amazonia_chla_*.tif"):
+        m = LATEST_RE.match(str(p))
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            rasters.append((y, mo, str(p)))
+    # depois, também aceitamos os finais com data_tag
+    for p in drive_root.rglob("pred/amazonia_chla_*__*.tif"):
+        s = str(p)
+        m = FINAL_RE.match(s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            # Não duplicar se já temos um LATEST desse mês/ano
+            if not any((yy==y and mm==mo) for (yy,mm,_) in rasters):
+                rasters.append((y, mo, s))
+    # ordena por (ano, mês)
+    rasters.sort(key=lambda t: (t[0], t[1], t[2]))
+    return rasters
+
+def open_raster(path):
+    with rio.open(path) as ds:
+        arr = ds.read(1, masked=True)
+        extent = plotting_extent(ds)   # coerente com affine/CRS do arquivo
+        transform = ds.transform
+        crs = ds.crs
+    return arr, extent, transform, crs
+
+def _load_roi_geoms_strict(shp_path, crs_override=None):
+    gdf = gpd.read_file(shp_path)
+    if gdf.empty:
+        raise RuntimeError(f"ROI vazia em {shp_path}")
+    if crs_override is not None:
+        gdf = gdf.set_crs(crs_override, allow_override=True)
+    if gdf.crs is None:
+        raise RuntimeError("A ROI não tem CRS. Defina ROI_CRS_OVERRIDE com o EPSG correto.")
+    geoms = [g for g in gdf.geometry if g is not None and not g.is_empty]
+    return geoms, gdf.crs
+
+def _roi_to_raster_crs(geoms, src_crs, raster_crs):
+    src = src_crs.to_string() if hasattr(src_crs, "to_string") else str(src_crs)
+    dst = raster_crs.to_string() if hasattr(raster_crs, "to_string") else str(raster_crs)
+    return [transform_geom(src, dst, mapping(g), precision=6) for g in geoms]
+
+def mask_with_roi_rasterize(arr, transform, raster_crs, shp_path=ROI_PATH):
+    geoms, src_crs = _load_roi_geoms_strict(shp_path, ROI_CRS_OVERRIDE)
+    geoms_tx = _roi_to_raster_crs(geoms, src_crs, raster_crs)
+    roi_mask = rasterize(
+        [(g, 1) for g in geoms_tx],
+        out_shape=arr.shape,
+        transform=transform,
+        fill=0,
+        all_touched=ALL_TOUCHED,
+        dtype="uint8"
+    ).astype(bool)
+    combined_mask = np.logical_or(getattr(arr, 'mask', np.zeros(arr.shape, bool)), ~roi_mask)
+    return np.ma.array(arr, mask=combined_mask), geoms_tx  # também retorna geometrias projetadas
+
+def climatology_month(records, month, reducer="mean"):
+    stacks = []
+    ref_shape = ref_extent = ref_transform = ref_crs = None
+    for y, m, f in records:
+        if m != month:
+            continue
+        arr, extent, transform, crs = open_raster(f)
+        if ref_shape is None:
+            ref_shape, ref_extent, ref_transform, ref_crs = arr.shape, extent, transform, crs
+            stacks.append(arr)
+        else:
+            # Empilha apenas se shape/grade/extensão forem idênticos
+            if arr.shape == ref_shape and extent == ref_extent:
+                stacks.append(arr)
+    if len(stacks) == 0:
+        return None, None, None, None, "sem dados"
+    data = np.ma.array(stacks)
+    if reducer == "median":
+        red = np.ma.median(data, axis=0)
+    else:
+        red = np.ma.mean(data, axis=0)
+    return red, ref_extent, ref_transform, ref_crs, "climatologia"
+
+# ===================== Carregar arquivos do Drive =====================
+records = find_monthly_files_recursively(DRIVE_ROOT)
+if not records:
+    raise RuntimeError(f"Nenhum GeoTIFF mensal encontrado em {DRIVE_ROOT} (esperado: */pred/amazonia_chla_YYYY-MM__*.tif ou LATEST_*.tif).")
+
+print(f"[INFO] Encontrados {len(records)} rasters (anos-meses únicos). Exemplos:")
+for y, m, f in records[:6]:
+    print(f"  {y}-{m:02d}: {Path(f).name}")
+if len(records) > 6:
+    print(f"  ... e mais {len(records)-6} itens")
+
+years_all = sorted({y for y,_,_ in records})
+years_span = f"{years_all[0]}–{years_all[-1]}" if years_all else "—"
+
+# ===================== Climatologia por mês das estações =====================
+arrs, extents, transforms, crss, tags = [], [], [], [], []
+print("[INFO] Climatologia por MÉDIA — empilhando todos os anos para cada mês das estações")
+for label, mo in SEASONS:
+    arr, extent, transform, crs, _tag = climatology_month(records, mo, reducer=REDUCER)
+    if arr is None:
+        raise RuntimeError(f"Sem dados para o mês {mo:02d} em nenhum ano para montar a climatologia.")
+    arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs)
+    tags.append(f"climatologia (média {years_span})")
+
+# ===================== Aplicar máscara da ROI =====================
+masked_arrs = []
+geoms_tx_plot = None
+try:
+    for arr, tr, crs in zip(arrs, transforms, crss):
+        masked_arr, geoms_tx = mask_with_roi_rasterize(arr, tr, crs, ROI_PATH)
+        masked_arrs.append(masked_arr)
+        if geoms_tx_plot is None:
+            geoms_tx_plot = geoms_tx
+except Exception as e:
+    print(f"[AVISO] Falha ao aplicar máscara da ROI ({e}). Continuando sem máscara.")
+    masked_arrs = arrs
+    geoms_tx_plot = None
+
+# ===================== Escala de cores robusta =====================
+all_vals = []
+for a in masked_arrs:
+    vals = a.compressed() if hasattr(a, 'compressed') else a[~np.isnan(a)]
+    if np.size(vals) > 0:
+        all_vals.append(vals)
+
+if not all_vals:
+    # fallback: usa arrays originais
+    for a in arrs:
+        vals = a.compressed() if hasattr(a, 'compressed') else a[~np.isnan(a)]
+        if np.size(vals) > 0:
+            all_vals.append(vals)
+    if not all_vals:
+        raise RuntimeError("Sem valores válidos nos rasters (mesmo sem máscara).")
+
+vals = np.concatenate(all_vals)
+vmin, vmax = np.percentile(vals, (PCTL_LOW, PCTL_HIGH))
+if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+    vmax = float(np.nanmax(vals)); vmin = max(0.0, float(np.nanmin(vals)))
+    if not np.isfinite(vmax) or vmax == vmin:
+        vmax = vmin + 1e-6
+cticks = np.linspace(vmin, vmax, 6)
+
+# ===================== Plot 2×2 =====================
+fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
+
+# Contorno da ROI (mesmas geometrias projetadas da máscara)
+roi_outline = None
+if geoms_tx_plot is not None and len(crss) > 0 and crss[0] is not None:
+    try:
+        roi_outline = gpd.GeoDataFrame(
+            geometry=[shp_shape(g) for g in geoms_tx_plot],
+            crs=crss[0]
+        )
+        print("[INFO] Contorno da ROI preparado para desenho")
+    except Exception as e:
+        print(f"[AVISO] Falha ao preparar contorno da ROI: {e}")
+        roi_outline = None
+
+for ax, (label, _mo), arr, extent, tr, crs, tag in zip(axes.flat, SEASONS, masked_arrs, extents, transforms, crss, tags):
+    norm = PowerNorm(gamma=POW_GAMMA, vmin=vmin, vmax=vmax)
+    im = ax.imshow(arr, extent=extent, cmap="viridis", norm=norm, interpolation="nearest")
+    ax.set_title(f"{label} — {tag}", fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_aspect("equal")
+    if roi_outline is not None:
+        try:
+            gdf_plot = roi_outline if str(roi_outline.crs) == str(crs) else roi_outline.to_crs(crs)
+            gdf_plot.boundary.plot(ax=ax, linewidth=1.2, edgecolor="black")
+        except Exception as e:
+            print(f"[AVISO] Falha ao desenhar contorno no subplot: {e}")
+
+# Barra de cores única
+cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02, ticks=cticks)
+cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+cbar.set_label("Clorofila-a (mg/m³)")
+
+fig.suptitle(
+    "Clorofila-a (MODIS) — Climatologia (média) nos equinócios/solstícios do Hemisfério Sul",
+    fontsize=13
+)
+
+# Nome do arquivo com intervalo de anos
+OUT_FIG = OUT_DIR / f"amazonia_chla_seasons_mean_{years_span.replace('–','-')}.png"
+plt.savefig(OUT_FIG, dpi=DPI_OUT)
+plt.close(fig)
+
+print(f"Figura salva em: {OUT_FIG} (DPI={DPI_OUT})")
